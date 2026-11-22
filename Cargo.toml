@@ -1,0 +1,67 @@
+[package]
+name = "dicom-lance"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+readme = "README.md"
+description = "DICOM ingestion, Lance v2.2 Blob V2 multimodal storage, DICOMweb server, and TypeScript Cornerstone3D viewer"
+keywords = ["dicom", "lance", "dicomweb", "medical-imaging", "cornerstone3d"]
+categories = ["science", "multimedia::images", "web-programming"]
+
+[dependencies]
+lance = { version = "14.0.3", default-features = false }
+lance-core = "14.0.3"
+lance-file = "14.0.3"
+lance-index = "14.0.3"
+arrow-array = "58.0.0"
+arrow-buffer = "58.0.0"
+arrow-schema = "58.0.0"
+axum = { version = "0.8", features = ["multipart"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "set-header"] }
+bytes = "1"
+dicom-core = "0.10"
+dicom-dictionary-std = "0.10"
+dicom-encoding = "0.10"
+dicom-object = "0.10"
+dicom-pixeldata = { version = "0.10", default-features = false, features = ["rle", "jpeg", "image"] }
+dicom-json = "0.10"
+png = "0.17"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "sync", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+http-body-util = "0.1"
+
+[profile.dev]
+debug = 0
+strip = "debuginfo"
+incremental = false
+
+[profile.test]
+debug = 0
+strip = "debuginfo"
+incremental = false
+
+[profile.release]
+debug = 0
+strip = "symbols"
+incremental = false
+codegen-units = 16
+
+[profile.release.package."*"]
+opt-level = 1
+debug = 0
+codegen-units = 16
+
+[profile.release.build-override]
+opt-level = 0
+debug = 0
+codegen-units = 16
