@@ -1,0 +1,12 @@
+/target/
+/data/
+*.lance/
+/.git/
+/.hegel/
+/docs/
+/web/node_modules/
+/web/dist/
+/web/playwright-report/
+/web/test-results/
+/web/blob-report/
+.DS_Store

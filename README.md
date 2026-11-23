@@ -2,6 +2,8 @@
 
 End-to-end **DICOM Part-10 ingestion**, **Lance v2.2 (`Blob V2`) multimodal storage + BM25 Full-Text Search**, **DICOMweb (`STOW-RS`, `QIDO-RS`, `WADO-RS`)**, and a **React 19 + TypeScript + Cornerstone3D v4** 2D Stack & 3D MPR workstation.
 
+![dicom-lance 3D MPR Chest CT and Lung-RADS SR viewer](docs/preview.png)
+
 ## Architecture
 
 ```mermaid
@@ -27,12 +29,21 @@ flowchart LR
 
 ## Quickstart
 
+### Local Build
+
 ```bash
 # 1. Build the TypeScript Cornerstone3D frontend
 cd web && npm install && npm run build && cd ..
 
 # 2. Run the Rust server and auto-seed the 3D CT (+ Lung-RADS SR) & Brain MRI phantoms
 cargo run --release -- --seed-on-start --port 8090 --data-dir ./data
+```
+
+### Docker Quickstart
+
+```bash
+docker build -t dicom-lance .
+docker run --rm -p 8090:8090 -e SEED_ON_START=true dicom-lance
 ```
 
 Open **http://127.0.0.1:8090** in your browser.
@@ -57,10 +68,12 @@ curl -i -H "Range: bytes=0-1023" \
 ## Test Suites
 
 ```bash
-# Rust integration tests (STOW-RS, Lance v2.2 BlobKind::Packed, BM25 FTS, WADO-RS & HU fidelity)
-cargo test
+# Rust Hegel PBT (`hegeltest`: MIME round-trip, HTTP Range/u64::MAX, SQLi validation,
+# 3D oblique slice permutation invariance, thumbnail rendering, SR recursion, Lance Blob V2 oracle)
+# + end-to-end & negative/error-path integration tests
+cargo test --locked
 
-# Frontend TypeScript check, production build, and Vitest unit tests
+# Frontend TypeScript check, production build, and Vitest + `@hegeldev/hegel` PBT suite
 cd web
 npm run build
 npm test
@@ -68,18 +81,20 @@ npm test
 # Install Chromium once if not using a preinstalled binary (or set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH)
 npx playwright install chromium
 
-# Hermetic Playwright E2E + axe-core WCAG 2.2 AA + no browser storage
+# Hermetic Playwright E2E + axe-core WCAG 2.2 AA + zero browser storage
 npm run test:e2e
 
-# Live Rust + Lance v2.2 + Cornerstone3D WebGL2 E2E (requires `cargo build` first)
+# Live Rust + Lance v2.2 + Cornerstone3D WebGL2 E2E (requires `cargo build --locked` first)
 npm run test:e2e:live
 ```
 
 ## Security & Clinical Disclaimer
 
 - **Research / Non-Diagnostic Use Only**: `dicom-lance` is an experimental reference implementation. It is **not** FDA-cleared, CE-marked, or intended for primary clinical diagnosis.
-- **Network Exposure**: By default the HTTP server binds to `127.0.0.1:8090` with permissive CORS and **no built-in authentication**. Place it behind TLS, authentication, and authorization before serving real patient data or exposing it beyond localhost.
+- **Network Exposure**: By default the HTTP server binds to `127.0.0.1:8090` with permissive CORS and **no built-in authentication**. Place it behind TLS, authentication, and authorization before serving real patient data or exposing it beyond localhost. See [SECURITY.md](SECURITY.md) for deployment guidance.
 
-## License
+## Contributing & License
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
