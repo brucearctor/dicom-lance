@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import {
   fetchStats,
   ingestDirectory,
+  type SearchMode,
   searchStudies,
   seedPhantoms,
   uploadDicomFiles,
@@ -13,6 +14,11 @@ import { DicomWorkspace } from './cornerstone/DicomWorkspace';
 import { purgeCornerstoneMemory } from './cornerstone/init';
 
 const MODALITY_FILTERS = ['ALL', 'CT', 'MR', 'SR'];
+const SEARCH_MODES: { id: SearchMode; label: string }[] = [
+  { id: 'hybrid', label: 'Hybrid' },
+  { id: 'bm25', label: 'BM25' },
+  { id: 'vector', label: 'Vector' },
+];
 
 export function App() {
   const [studies, setStudies] = useState<StudySummary[]>([]);
@@ -20,6 +26,8 @@ export function App() {
   const [stats, setStats] = useState<StoreStats | null>(null);
   const [query, setQuery] = useState('');
   const [modality, setModality] = useState('ALL');
+  const [searchMode, setSearchMode] = useState<SearchMode>('hybrid');
+  const [pendingSliceIndex, setPendingSliceIndex] = useState<number | null>(null);
   const [statusMessage, setStatusMessage] = useState('Initializing Lance v2.2 catalog...');
   const [busy, setBusy] = useState(false);
 
@@ -29,9 +37,9 @@ export function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const refreshData = useCallback(
-    async (nextQuery: string, nextModality: string) => {
+    async (nextQuery: string, nextModality: string, nextMode: SearchMode) => {
       const [studyResults, nextStats] = await Promise.all([
-        searchStudies(nextQuery, nextModality),
+        searchStudies(nextQuery, nextModality, nextMode),
         fetchStats(),
       ]);
       setStudies(studyResults);
@@ -62,7 +70,7 @@ export function App() {
   );
 
   useEffect(() => {
-    void refreshData('', 'ALL').catch((err) => {
+    void refreshData('', 'ALL', 'hybrid').catch((err) => {
       setStatusMessage(err instanceof Error ? err.message : 'Failed to load catalog');
     });
     return () => {
@@ -100,7 +108,7 @@ export function App() {
     e.preventDefault();
     setBusy(true);
     try {
-      await refreshData(query, modality);
+      await refreshData(query, modality, searchMode);
     } catch (err) {
       setStatusMessage(err instanceof Error ? err.message : 'Search failed');
     } finally {
@@ -112,11 +120,35 @@ export function App() {
     setModality(nextModality);
     setBusy(true);
     try {
-      await refreshData(query, nextModality);
+      await refreshData(query, nextModality, searchMode);
     } catch (err) {
       setStatusMessage(err instanceof Error ? err.message : 'Filter failed');
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleSearchModeSelect = async (nextMode: SearchMode) => {
+    setSearchMode(nextMode);
+    if (!query.trim()) return;
+    setBusy(true);
+    try {
+      await refreshData(query, modality, nextMode);
+    } catch (err) {
+      setStatusMessage(err instanceof Error ? err.message : 'Search failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleNavigateToSlice = (targetSeriesUid: string, sliceSortIndex: number) => {
+    setPendingSliceIndex(sliceSortIndex);
+    for (const st of studies) {
+      const match = st.series.find((s) => s.series_instance_uid === targetSeriesUid);
+      if (match) {
+        setSelectedSeries(match);
+        return;
+      }
     }
   };
 
@@ -125,7 +157,7 @@ export function App() {
     setStatusMessage('Generating 3D CT + SR + Brain MRI phantoms into Lance v2.2...');
     try {
       const report = await seedPhantoms();
-      await refreshData(query, modality);
+      await refreshData(query, modality, searchMode);
       setStatusMessage(
         `Ingested ${report.series_ingested} series (${report.frames_ingested} frames) into Lance v2.2.`,
       );
@@ -170,7 +202,7 @@ export function App() {
       setSelectedFiles(null);
       setDirPath('');
       uploadDialogRef.current?.close();
-      await refreshData(query, modality);
+      await refreshData(query, modality, searchMode);
       setStatusMessage(
         `Ingested ${report.series_ingested} series (${report.frames_ingested} frames) into Lance v2.2.`,
       );
@@ -183,6 +215,8 @@ export function App() {
 
   const selectedStudy =
     studies.find((st) => st.study_instance_uid === selectedSeries?.study_instance_uid) ?? null;
+  const scoreBadgePrefix =
+    searchMode === 'bm25' ? 'BM25' : searchMode === 'vector' ? 'Vec' : 'RRF';
 
   return (
     <div className="app-shell">
@@ -230,7 +264,7 @@ export function App() {
               onSubmit={(e) => void handleSearchSubmit(e)}
             >
               <label htmlFor="study-search" className="search-label">
-                Search studies (Lance BM25 FTS + tags)
+                Search studies (Hybrid BM25 + Vector)
               </label>
               <div className="search-row">
                 <input
@@ -238,7 +272,7 @@ export function App() {
                   name="q"
                   type="search"
                   className="text-input"
-                  placeholder="spiculated, Lung-RADS, frontal..."
+                  placeholder="spiculated, Lung-RADS, nodular..."
                   value={query}
                   autoCorrect="off"
                   autoCapitalize="none"
@@ -256,7 +290,7 @@ export function App() {
                   className="btn"
                   onClick={() => {
                     setQuery('');
-                    void refreshData('', modality);
+                    void refreshData('', modality, searchMode);
                   }}
                 >
                   Clear Search
@@ -264,6 +298,20 @@ export function App() {
               )}
             </form>
           </search>
+
+          <div className="modality-row" role="group" aria-label="Search mode">
+            {SEARCH_MODES.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                className="btn"
+                aria-pressed={searchMode === m.id}
+                onClick={() => void handleSearchModeSelect(m.id)}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
 
           <div className="modality-row" role="group" aria-label="Modality filter">
             {MODALITY_FILTERS.map((m) => (
@@ -296,7 +344,10 @@ export function App() {
                     <div className="study-meta">{study.study_description}</div>
                   </div>
                   {study.max_score !== null && (
-                    <span className="pill">BM25 {study.max_score.toFixed(2)}</span>
+                    <span className="pill">
+                      {scoreBadgePrefix}{' '}
+                      {study.max_score.toFixed(searchMode === 'hybrid' ? 4 : 2)}
+                    </span>
                   )}
                 </div>
 
@@ -349,6 +400,9 @@ export function App() {
             series={selectedSeries}
             siblingSeries={selectedStudy?.series ?? []}
             onSelectSeries={setSelectedSeries}
+            onNavigateToSlice={handleNavigateToSlice}
+            requestedSliceIndex={pendingSliceIndex}
+            onConsumedRequestedSlice={() => setPendingSliceIndex(null)}
           />
         </main>
       </div>

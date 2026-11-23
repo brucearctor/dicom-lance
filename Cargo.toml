@@ -8,11 +8,20 @@ description = "DICOM ingestion, Lance v2.2 Blob V2 multimodal storage, DICOMweb 
 keywords = ["dicom", "lance", "dicomweb", "medical-imaging", "cornerstone3d"]
 categories = ["science", "multimedia::images", "web-programming"]
 
+[features]
+default = []
+cloud-s3 = ["lance/aws"]
+cloud-gcs = ["lance/gcp"]
+cloud-azure = ["lance/azure"]
+cloud = ["cloud-s3", "cloud-gcs"]
+
 [dependencies]
 lance = { version = "14.0.3", default-features = false }
 lance-core = "14.0.3"
 lance-file = "14.0.3"
 lance-index = "14.0.3"
+lance-linalg = "14.0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 arrow-array = "58.0.0"
 arrow-buffer = "58.0.0"
 arrow-schema = "58.0.0"

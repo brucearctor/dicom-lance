@@ -13,6 +13,13 @@ describe('DICOM Lance API helpers', () => {
       '/api/search?q=spiculated+nodule',
     );
     expect(buildSearchUrl('frontal', 'MR')).toBe('/api/search?q=frontal&modality=MR');
+    expect(buildSearchUrl('spiculated', 'ALL', 'hybrid')).toBe('/api/search?q=spiculated');
+    expect(buildSearchUrl('spiculated', 'ALL', 'bm25')).toBe(
+      '/api/search?q=spiculated&mode=bm25',
+    );
+    expect(buildSearchUrl('nodular', 'CT', 'vector')).toBe(
+      '/api/search?q=nodular&modality=CT&mode=vector',
+    );
   });
 
   it('constructs WADO-RS Cornerstone imageIds without trailing slashes', () => {

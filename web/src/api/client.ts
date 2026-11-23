@@ -52,6 +52,24 @@ export interface FrameDescriptor {
   transfer_syntax_uid: string;
 }
 
+export type SearchMode = 'hybrid' | 'bm25' | 'vector';
+
+export interface SimilarFrameHit {
+  study_instance_uid: string;
+  series_instance_uid: string;
+  sop_instance_uid: string;
+  frame_number: number;
+  slice_sort_index: number;
+  instance_number: number;
+  slice_location: number;
+  ipp_z: number;
+  modality: string;
+  series_description: string;
+  patient_name: string;
+  similarity: number;
+  distance: number;
+}
+
 export interface DatasetStats {
   exists: boolean;
   version: number;
@@ -63,6 +81,10 @@ export interface DatasetStats {
 
 export interface StoreStats {
   data_dir: string;
+  storage_uri?: string;
+  embedder?: string;
+  cache_hits_series?: number;
+  cache_hits_frames?: number;
   blob_v2_kind_sample: string | null;
   blob_v2_inline_threshold_bytes: number;
   series_dataset: DatasetStats;
@@ -99,7 +121,11 @@ export function computeVoiRange(wc: number, ww: number): { lower: number; upper:
   };
 }
 
-export function buildSearchUrl(query: string, modality: string): string {
+export function buildSearchUrl(
+  query: string,
+  modality: string,
+  mode: SearchMode = 'hybrid',
+): string {
   const params = new URLSearchParams();
   const trimmed = query.trim();
   if (trimmed) {
@@ -107,6 +133,9 @@ export function buildSearchUrl(query: string, modality: string): string {
   }
   if (modality && modality !== 'ALL') {
     params.set('modality', modality);
+  }
+  if (mode !== 'hybrid') {
+    params.set('mode', mode);
   }
   const qs = params.toString();
   return qs ? `/api/search?${qs}` : '/api/search';
@@ -131,8 +160,12 @@ export async function fetchStats(): Promise<StoreStats> {
   return (await res.json()) as StoreStats;
 }
 
-export async function searchStudies(query: string, modality: string): Promise<StudySummary[]> {
-  const res = await fetch(buildSearchUrl(query, modality));
+export async function searchStudies(
+  query: string,
+  modality: string,
+  mode: SearchMode = 'hybrid',
+): Promise<StudySummary[]> {
+  const res = await fetch(buildSearchUrl(query, modality, mode));
   if (!res.ok) {
     throw new Error(`Search failed: ${res.status}`);
   }
@@ -198,4 +231,21 @@ export async function fetchFramesManifest(
   }
   const data = (await res.json()) as { frames: FrameDescriptor[] };
   return data.frames;
+}
+
+export async function fetchSimilarFrames(
+  studyUid: string,
+  seriesUid: string,
+  sopUid: string,
+  frameNumber: number,
+  limit = 6,
+): Promise<SimilarFrameHit[]> {
+  const res = await fetch(
+    `/api/studies/${studyUid}/series/${seriesUid}/instances/${sopUid}/frames/${frameNumber}/similar?limit=${limit}`,
+  );
+  if (!res.ok) {
+    throw new Error(`Similar frames failed: ${res.status}`);
+  }
+  const data = (await res.json()) as { hits: SimilarFrameHit[] };
+  return data.hits;
 }

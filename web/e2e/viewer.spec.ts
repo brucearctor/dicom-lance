@@ -223,6 +223,38 @@ test.describe('DICOM on Lance Workstation (Hermetic Tier-2 E2E)', () => {
         body: buildSyntheticFrameMultipart(64, 64),
       }),
     );
+
+    await page.route('**/api/studies/**/similar**', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          query: {
+            study_instance_uid: STUDY_UID,
+            series_instance_uid: CT_SERIES_UID,
+            sop_instance_uid: SOP_UID,
+            frame_number: 1,
+          },
+          hits: [
+            {
+              study_instance_uid: STUDY_UID,
+              series_instance_uid: CT_SERIES_UID,
+              sop_instance_uid: `${CT_SERIES_UID}.24`,
+              frame_number: 1,
+              slice_sort_index: 0,
+              instance_number: 24,
+              slice_location: -22.5,
+              ipp_z: -22.5,
+              modality: 'CT',
+              series_description: 'Axial Lung 2.5mm RUL Spiculated Nodule',
+              patient_name: 'Rivera^Elena',
+              similarity: 0.964,
+              distance: 0.036,
+            },
+          ],
+        }),
+      }),
+    );
   });
 
   test('renders telemetry, search, SR view, upload modal, Zero Browser Storage, and WCAG 2.2 AA', async ({
@@ -235,14 +267,40 @@ test.describe('DICOM on Lance Workstation (Hermetic Tier-2 E2E)', () => {
     await expect(page.getByText('Blob V2: Packed')).toBeVisible();
     await expect(page.getByText('Rivera^Elena')).toBeVisible();
 
+    // Open Similar Slices panel while CT series is active
+    const similarBtn = page.getByRole('button', { name: 'Similar Slices' });
+    await expect(similarBtn).toBeEnabled({ timeout: 15_000 });
+    await similarBtn.click();
+    const similarPanel = page.getByRole('complementary', { name: 'Similar Slices' });
+    await expect(similarPanel).toBeVisible();
+    await expect(similarPanel.getByText('96.4%')).toBeVisible();
+
+    // Test search mode toggle + search box
+    const searchRequests: string[] = [];
+    page.on('request', (req) => {
+      if (req.url().includes('/api/search')) {
+        searchRequests.push(req.url());
+      }
+    });
+    await page.getByRole('searchbox', { name: /search studies/i }).fill('spiculated');
+    await page.getByRole('button', { name: 'Vector', exact: true }).click();
+    await expect.poll(() => searchRequests.some((u) => u.includes('mode=vector'))).toBe(true);
+    await page.getByRole('button', { name: 'Hybrid', exact: true }).click();
+    await expect(page.getByText(/Showing 1 studies/)).toBeVisible();
+
+    // WCAG 2.2 AA accessibility audit with Similar Slices panel expanded
+    const a11yResults = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
+      .options({ rules: { 'target-size': { enabled: true } } })
+      .analyze();
+    expect(a11yResults.violations).toEqual([]);
+
     // Verify modality filter and SR view
     await page.getByRole('button', { name: 'SR', exact: true }).click();
     await expect(page.getByText(/Lung-RADS 4B/)).toBeVisible();
 
     await page.getByRole('button', { name: 'ALL', exact: true }).click();
-    await page.getByRole('searchbox', { name: /search studies/i }).fill('spiculated');
-    await page.getByRole('button', { name: 'Search', exact: true }).click();
-    await expect(page.getByText(/Showing 1 studies/)).toBeVisible();
+    await page.getByRole('button', { name: 'Clear Search' }).click();
 
     // Native <dialog> open and Esc / Cancel close
     await page.getByRole('button', { name: 'Upload DICOM' }).click();
@@ -257,13 +315,6 @@ test.describe('DICOM on Lance Workstation (Hermetic Tier-2 E2E)', () => {
       session: window.sessionStorage.length,
     }));
     expect(storageCounts).toEqual({ local: 0, session: 0 });
-
-    // WCAG 2.2 AA accessibility audit
-    const a11yResults = await new AxeBuilder({ page })
-      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
-      .options({ rules: { 'target-size': { enabled: true } } })
-      .analyze();
-    expect(a11yResults.violations).toEqual([]);
 
     expect(errors).toEqual([]);
   });

@@ -19,7 +19,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::dicom_ingest::{parse_dicom_instances, IngestError};
 use crate::phantom::{generate_phantom_dicom_files, PhantomError};
-use crate::store::{DicomLanceStore, IngestReport, StoreError, StudySummary};
+use crate::store::{DicomLanceStore, IngestReport, SearchMode, StoreError, StudySummary};
 
 const WADO_BOUNDARY: &str = "dicom-lance-boundary";
 
@@ -72,10 +72,18 @@ pub struct SearchParams {
     pub modality: Option<String>,
     pub patient_id: Option<String>,
     pub limit: Option<usize>,
+    pub mode: Option<SearchMode>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SimilarParams {
+    pub limit: Option<usize>,
+    pub exclude_self: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
+    pub mode: SearchMode,
     pub studies: Vec<StudySummary>,
 }
 
@@ -94,6 +102,10 @@ pub fn build_router(store: Arc<DicomLanceStore>, static_dir: Option<PathBuf>) ->
         .route(
             "/api/studies/{study}/series/{series}/frames-manifest",
             get(get_frames_manifest),
+        )
+        .route(
+            "/api/studies/{study}/series/{series}/instances/{sop}/frames/{frame}/similar",
+            get(similar_frames),
         )
         .route(
             "/api/series/{study}/{series}/thumbnail",
@@ -157,32 +169,58 @@ async fn search_get(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<SearchResponse>, ApiError> {
+    let mode = params.mode.unwrap_or_default();
     let studies = state
         .store
-        .search_series(
+        .search_series_with_mode(
             params.q.as_deref(),
             params.modality.as_deref(),
             params.patient_id.as_deref(),
             params.limit.unwrap_or(50),
+            mode,
         )
         .await?;
-    Ok(Json(SearchResponse { studies }))
+    Ok(Json(SearchResponse { mode, studies }))
 }
 
 async fn search_post(
     State(state): State<AppState>,
     Json(params): Json<SearchParams>,
 ) -> Result<Json<SearchResponse>, ApiError> {
+    let mode = params.mode.unwrap_or_default();
     let studies = state
         .store
-        .search_series(
+        .search_series_with_mode(
             params.q.as_deref(),
             params.modality.as_deref(),
             params.patient_id.as_deref(),
             params.limit.unwrap_or(50),
+            mode,
         )
         .await?;
-    Ok(Json(SearchResponse { studies }))
+    Ok(Json(SearchResponse { mode, studies }))
+}
+
+async fn similar_frames(
+    State(state): State<AppState>,
+    AxumPath((study, series, sop, frame)): AxumPath<(String, String, String, i32)>,
+    Query(params): Query<SimilarParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let limit = params.limit.unwrap_or(6);
+    let exclude_self = params.exclude_self.unwrap_or(true);
+    let hits = state
+        .store
+        .find_similar_frames(&study, &series, &sop, frame, limit, exclude_self)
+        .await?;
+    Ok(Json(serde_json::json!({
+        "query": {
+            "study_instance_uid": study,
+            "series_instance_uid": series,
+            "sop_instance_uid": sop,
+            "frame_number": frame,
+        },
+        "hits": hits,
+    })))
 }
 
 async fn get_frames_manifest(
@@ -213,11 +251,30 @@ async fn get_series_thumbnail(
 }
 
 pub async fn seed_phantoms_into_store(store: &DicomLanceStore) -> Result<IngestReport, ApiError> {
-    let phantom_dir = store.root_dir().join("phantoms");
-    let paths = tokio::task::spawn_blocking(move || generate_phantom_dicom_files(&phantom_dir))
+    let (phantom_dir, cleanup_dir) = if let Some(local_root) = store.local_root_dir() {
+        (local_root.join("phantoms"), None)
+    } else {
+        let unique = format!(
+            "dicom-lance-phantoms-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let tmp = std::env::temp_dir().join(unique);
+        (tmp.clone(), Some(tmp))
+    };
+
+    let gen_dir = phantom_dir.clone();
+    let paths = tokio::task::spawn_blocking(move || generate_phantom_dicom_files(&gen_dir))
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))??;
-    ingest_paths(store, &paths).await
+    let result = ingest_paths(store, &paths).await;
+    if let Some(dir) = cleanup_dir {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+    result
 }
 
 async fn seed_phantoms(State(state): State<AppState>) -> Result<Json<IngestReport>, ApiError> {
@@ -462,11 +519,12 @@ async fn qido_studies(
 ) -> Result<Response, ApiError> {
     let studies = state
         .store
-        .search_series(
+        .search_series_with_mode(
             params.q.as_deref(),
             params.modality.as_deref(),
             params.patient_id.as_deref(),
             params.limit.unwrap_or(50),
+            params.mode.unwrap_or_default(),
         )
         .await?;
 
@@ -635,6 +693,15 @@ pub async fn serve(
     seed_on_start: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(DicomLanceStore::new(data_dir));
+    serve_with_store(addr, store, static_dir, seed_on_start).await
+}
+
+pub async fn serve_with_store(
+    addr: SocketAddr,
+    store: Arc<DicomLanceStore>,
+    static_dir: Option<PathBuf>,
+    seed_on_start: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if seed_on_start {
         let stats = store.get_stats().await?;
         if stats.series_dataset.row_count == 0 {

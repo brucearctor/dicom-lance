@@ -3,7 +3,7 @@
 [![CI](https://github.com/brucearctor/dicom-lance/actions/workflows/ci.yml/badge.svg)](https://github.com/brucearctor/dicom-lance/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-End-to-end **DICOM Part-10 ingestion**, **Lance v2.2 (`Blob V2`) multimodal storage + BM25 Full-Text Search**, **DICOMweb (`STOW-RS`, `QIDO-RS`, `WADO-RS`)**, and a **React 19 + TypeScript + Cornerstone3D v4** 2D Stack & 3D MPR workstation.
+End-to-end **DICOM Part-10 ingestion**, **Lance v2.2 (`Blob V2`) multimodal storage + Hybrid BM25 & 768-d Vector Search**, **DICOMweb (`STOW-RS`, `QIDO-RS`, `WADO-RS`)**, and a **React 19 + TypeScript + Cornerstone3D v4** 2D Stack & 3D MPR workstation.
 
 ![dicom-lance 3D MPR Chest CT and Lung-RADS SR viewer](docs/preview.png)
 
@@ -11,24 +11,32 @@ End-to-end **DICOM Part-10 ingestion**, **Lance v2.2 (`Blob V2`) multimodal stor
 
 ```mermaid
 flowchart LR
-    DCM["Part-10 .dcm Files<br/>(Upload / Dir / STOW-RS / 3D Phantoms)"] --> ING["Rust DICOM Ingest<br/>• dicom-object / dicom-pixeldata 0.10<br/>• Sort slices along 3D normal<br/>• Extract DICOM SR text<br/>• Render 128x128 PNG thumbnail"]
-    ING --> SER[("dicom_series.lance (v2.2)<br/>• Study/Series metadata & SR text<br/>• Lance Inverted BM25 FTS + BTree<br/>• 768-d embedding column (ready)")]
-    ING --> FRM[("dicom_frames.lance (v2.2)<br/>• Geometry/VOI scalars + dicom_json_header<br/>• Blob V2 pixel_frame_blob (Packed)")]
-    SER & FRM --> API["Axum Server (:8090)<br/>• /api/search (BM25 + SQL prefilter)<br/>• /dicomweb/.../metadata (zero blob I/O)<br/>• /dicomweb/.../frames/{n} (take_blobs + Range)"]
-    API <--> UI["React 19 + Cornerstone3D v4<br/>• 2D Stack + 3D MPR (Axial/Sag/Cor)<br/>• W/L presets, RECIST/ROI, Crosshairs<br/>• In-memory cache only (no browser storage)"]
+    DCM["Part-10 .dcm Files<br/>(Upload / Dir / STOW-RS / 3D Phantoms)"] --> ING["Rust DICOM Ingest<br/>• dicom-object / dicom-pixeldata 0.10<br/>• Sort slices along 3D normal<br/>• Extract DICOM SR text + 128x128 PNG<br/>• Embed 768-d text + pixel radiomics"]
+    ING --> SER[("dicom_series.lance (v2.2)<br/>• Study/Series metadata & SR text<br/>• Inverted BM25 FTS + BTree<br/>• 768-d series_embedding (Cosine KNN / IVF_FLAT)")]
+    ING --> FRM[("dicom_frames.lance (v2.2)<br/>• Geometry/VOI scalars + dicom_json_header<br/>• 768-d frame_embedding (Similar Slices)<br/>• Blob V2 pixel_frame_blob (Packed)")]
+    SER & FRM --> API["Axum Server (:8090)<br/>• Cached Arc&lt;Dataset&gt; handles<br/>• /api/search?mode=hybrid|bm25|vector (RRF)<br/>• /api/.../similar (Cosine KNN)<br/>• /dicomweb/.../frames/{n} (take_blobs + Range)"]
+    API <--> UI["React 19 + Cornerstone3D v4<br/>• 2D Stack + 3D MPR (Axial/Sag/Cor)<br/>• Similar Slices drawer &amp; Search Modes<br/>• In-memory cache only (no browser storage)"]
 ```
 
 ## Lance v2.2 Two-Dataset Schema
 
 1. **`dicom_series.lance`** (`data/lance/dicom_series.lance`):
    - Primary merge key: `(study_instance_uid, series_instance_uid)`.
-   - Indexed with Lance `Inverted` BM25 FTS (`searchable_text_fts` with positions) and `BTree` scalar indexes (`study_instance_uid`, `modality`).
-   - Holds `sr_text` (extracted from `DICOM SR` `ContentSequence`), `thumbnail_png`, spacing/VOI defaults, and nullable `series_embedding` (`FixedSizeList<Float32, 768>`).
+   - Indexed with Lance `Inverted` BM25 FTS (`searchable_text_fts` with positions), `BTree` scalar indexes (`study_instance_uid`, `modality`), and `IVF_FLAT` vector index on `series_embedding` (at `>= 256` rows; exact Cosine KNN below threshold).
+   - Holds `sr_text` (extracted from `DICOM SR` `ContentSequence`), `thumbnail_png`, spacing/VOI defaults, and `series_embedding` (`FixedSizeList<Float32, 768>`).
 2. **`dicom_frames.lance`** (`data/lance/dicom_frames.lance`):
    - Primary merge key: `(study_instance_uid, series_instance_uid, sop_instance_uid, frame_number)`.
+   - Indexed with `BTree` scalar indexes (`study_instance_uid`, `series_instance_uid`, `sop_instance_uid`) and `IVF_FLAT` vector index on `frame_embedding` (`>= 256` rows).
    - Physically sorted along slice normal `cross(row_cosines, col_cosines)`.
    - Projects `dicom_json_header` (`PixelData` stripped, `"00020010"` TransferSyntaxUID injected) for fast WADO-RS metadata reads without touching pixel payloads.
-   - Stores decoded frames out-of-line in **`pixel_frame_blob`** (`lance::blob::blob_field_with_options` with `4 KiB` inline threshold -> `BlobKind::Packed` sidecar files), served via `Dataset::take_blobs` and `BlobFile::read` / `BlobFile::read_range`.
+   - Stores decoded frames out-of-line in **`pixel_frame_blob`** (`lance::blob::blob_field_with_options` with `4 KiB` inline threshold -> `BlobKind::Packed` sidecar files), served via cached `Dataset` handles, `Dataset::take_blobs`, and `BlobFile::read` / `BlobFile::read_range`.
+
+## Multimodal Embeddings, Hybrid Search & Cloud Storage
+
+- **Hybrid Search (`Hybrid` / `BM25` / `Vector`)**: Combines Lance BM25 full-text search with 768-d cosine KNN vector search via Reciprocal Rank Fusion (`k = 60`), supporting subword/semantic recall (e.g., `"nodular"` -> Chest CT / Lung-RADS SR) as well as exact clinical tags.
+- **Find Similar Slices**: Queries `frame_embedding` via Lance `Scanner::nearest` (`MetricType::Cosine`) at `GET /api/studies/{study}/series/{series}/instances/{sop}/frames/{frame}/similar` and provides click-to-jump slice navigation in the viewer.
+- **Pluggable Embedder**: Uses a pure-Rust deterministic `local-multimodal-768` embedder (512-d text n-gram hashing + 256-d pixel radiomics/spatial descriptors) by default, or any OpenAI-compatible `/v1/embeddings` endpoint via `--embedder-url` (`EMBEDDER_URL`), `--embedder-model`, and `--embedder-api-key`.
+- **Cloud & Remote Object Storage**: Supports local paths, `file://`, `shared-memory://`, and `memory://` out of the box via `--dataset-uri` (`DATASET_URI`). Enable native S3/GCS/Azure object stores at compile time with `--features cloud` (`cloud-s3`, `cloud-gcs`, `cloud-azure`; requires `cmake` for `aws-lc-rs`).
 
 ## Quickstart
 
@@ -57,8 +65,11 @@ Open **http://127.0.0.1:8090** in your browser.
 # Lance telemetry (confirms v2.2, BM25 FTS index, and Packed Blob V2)
 curl -s http://127.0.0.1:8090/api/stats | jq
 
-# BM25 full-text search across DICOM metadata + SR findings
-curl -s "http://127.0.0.1:8090/api/search?q=spiculated+right+upper+lobe" | jq
+# Hybrid BM25 + 768-d vector search across DICOM metadata, SR findings & radiomics
+curl -s "http://127.0.0.1:8090/api/search?q=spiculated+right+upper+lobe&mode=hybrid" | jq
+
+# Cosine KNN "Find Similar Slices" for Chest CT nodule slice 23
+curl -s "http://127.0.0.1:8090/api/studies/1.2.826.0.1.3680043.10.5432.1001/series/1.2.826.0.1.3680043.10.5432.1001.1/instances/1.2.826.0.1.3680043.10.5432.1001.1.23/frames/1/similar?limit=5" | jq
 
 # WADO-RS series metadata (projects JSON column only; zero blob I/O)
 curl -s "http://127.0.0.1:8090/dicomweb/studies/1.2.826.0.1.3680043.10.5432.1001/series/1.2.826.0.1.3680043.10.5432.1001.1/metadata" | jq 'length'

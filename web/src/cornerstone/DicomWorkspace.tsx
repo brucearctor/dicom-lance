@@ -22,8 +22,10 @@ import {
   computeVoiRange,
   fetchFramesManifest,
   fetchSeriesMetadata,
+  fetchSimilarFrames,
   type FrameDescriptor,
   type SeriesSummary,
+  type SimilarFrameHit,
   WINDOW_PRESETS,
 } from '../api/client';
 import { initCornerstoneOnce, prepareSeriesImageIds, type ToolMode } from './init';
@@ -32,6 +34,9 @@ interface DicomWorkspaceProps {
   series: SeriesSummary | null;
   siblingSeries: SeriesSummary[];
   onSelectSeries: (series: SeriesSummary) => void;
+  onNavigateToSlice?: (seriesUid: string, sliceSortIndex: number) => void;
+  requestedSliceIndex?: number | null;
+  onConsumedRequestedSlice?: () => void;
 }
 
 type ViewMode = 'stack' | 'mpr';
@@ -85,6 +90,9 @@ export function DicomWorkspace({
   series,
   siblingSeries,
   onSelectSeries,
+  onNavigateToSlice,
+  requestedSliceIndex,
+  onConsumedRequestedSlice,
 }: DicomWorkspaceProps) {
   const rawUid = useId().replace(/:/g, '_');
   const engineId = `lance_engine_${rawUid}`;
@@ -98,6 +106,10 @@ export function DicomWorkspace({
   const [sliceIndex, setSliceIndex] = useState<number>(0);
   const [loadStatus, setLoadStatus] = useState<string>('Select a series to load');
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [showSimilar, setShowSimilar] = useState<boolean>(false);
+  const [similarLoading, setSimilarLoading] = useState<boolean>(false);
+  const [similarError, setSimilarError] = useState<string | null>(null);
+  const [similarHits, setSimilarHits] = useState<SimilarFrameHit[]>([]);
 
   const stackElRef = useRef<HTMLDivElement | null>(null);
   const axialElRef = useRef<HTMLDivElement | null>(null);
@@ -115,6 +127,9 @@ export function DicomWorkspace({
       }
     }
     setPresetId('auto');
+    setShowSimilar(false);
+    setSimilarHits([]);
+    setSimilarError(null);
   }, [series?.series_instance_uid]);
 
   useEffect(() => {
@@ -206,10 +221,10 @@ export function DicomWorkspace({
           applyActiveTool(toolGroupId, toolMode, 'stack');
 
           const stackVp = engine.getViewport(vpId) as Types.IStackViewport;
-          const initialSlice = Math.min(
-            Math.floor(imageIds.length / 3),
-            imageIds.length - 1,
-          );
+          const initialSlice =
+            requestedSliceIndex !== null && requestedSliceIndex !== undefined
+              ? Math.min(Math.max(0, requestedSliceIndex), imageIds.length - 1)
+              : Math.min(Math.floor(imageIds.length / 3), imageIds.length - 1);
           setSliceIndex(initialSlice);
 
           const onNewImage = (evt: Event) => {
@@ -373,6 +388,64 @@ export function DicomWorkspace({
   }, [mipEnabled, viewMode, series?.series_instance_uid]);
 
   const activeFrame = frames[sliceIndex];
+
+  useEffect(() => {
+    if (requestedSliceIndex === null || requestedSliceIndex === undefined) return;
+    if (frames.length === 0 || viewMode !== 'stack') return;
+    const clamped = Math.min(Math.max(0, requestedSliceIndex), frames.length - 1);
+    setSliceIndex(clamped);
+    const vp = engineRef.current?.getViewport('STACK_AXIAL') as
+      | Types.IStackViewport
+      | undefined;
+    if (vp) {
+      void vp.setImageIdIndex(clamped);
+    }
+    onConsumedRequestedSlice?.();
+  }, [requestedSliceIndex, frames.length, viewMode, onConsumedRequestedSlice]);
+
+  const handleToggleSimilar = async () => {
+    if (showSimilar) {
+      setShowSimilar(false);
+      return;
+    }
+    if (!series || !activeFrame) return;
+    setShowSimilar(true);
+    setSimilarLoading(true);
+    setSimilarError(null);
+    try {
+      const hits = await fetchSimilarFrames(
+        series.study_instance_uid,
+        series.series_instance_uid,
+        activeFrame.sop_instance_uid,
+        activeFrame.frame_number,
+        6,
+      );
+      setSimilarHits(hits);
+    } catch (err) {
+      setSimilarError(err instanceof Error ? err.message : 'Failed to find similar slices');
+      setSimilarHits([]);
+    } finally {
+      setSimilarLoading(false);
+    }
+  };
+
+  const handleSelectSimilarHit = async (hit: SimilarFrameHit) => {
+    if (series && hit.series_instance_uid === series.series_instance_uid) {
+      const clamped = Math.min(
+        Math.max(0, hit.slice_sort_index),
+        Math.max(0, frames.length - 1),
+      );
+      if (viewMode !== 'stack') {
+        onNavigateToSlice?.(hit.series_instance_uid, clamped);
+        setViewMode('stack');
+      } else {
+        await handleSliceChange(clamped);
+      }
+      return;
+    }
+    setShowSimilar(false);
+    onNavigateToSlice?.(hit.series_instance_uid, hit.slice_sort_index);
+  };
 
   const volumetricSibling = useMemo(
     () => siblingSeries.find((s) => s.frame_count > 0) ?? null,
@@ -552,6 +625,18 @@ export function DicomWorkspace({
             Reset View
           </button>
         </div>
+
+        <div className="toolbar-group" role="group" aria-label="Vector similarity search">
+          <button
+            type="button"
+            className="btn"
+            aria-expanded={showSimilar}
+            disabled={!activeFrame || similarLoading}
+            onClick={() => void handleToggleSimilar()}
+          >
+            {similarLoading ? 'Searching...' : 'Similar Slices'}
+          </button>
+        </div>
       </div>
 
       {loadError && (
@@ -560,54 +645,109 @@ export function DicomWorkspace({
         </div>
       )}
 
-      {viewMode === 'stack' ? (
-        <div className="viewport-stage mode-stack">
-          <div className="viewport-cell">
-            <div
-              ref={stackElRef}
-              className="viewport-canvas-host"
-              aria-label="2D Stack Viewport"
-              onContextMenu={(e) => e.preventDefault()}
-            />
-            <div className="viewport-hud">
-              {series.modality} · {series.rows}×{series.columns} · Slice {sliceIndex + 1}/
-              {Math.max(frames.length, series.frame_count)}
-              {activeFrame ? ` · z = ${activeFrame.ipp_z.toFixed(1)} mm` : ''} · W:{hudWw} L:
-              {hudWc}
+      <div className="viewport-body">
+        {viewMode === 'stack' ? (
+          <div className="viewport-stage mode-stack">
+            <div className="viewport-cell">
+              <div
+                ref={stackElRef}
+                role="region"
+                className="viewport-canvas-host"
+                aria-label="2D Stack Viewport"
+                onContextMenu={(e) => e.preventDefault()}
+              />
+              <div className="viewport-hud">
+                {series.modality} · {series.rows}×{series.columns} · Slice {sliceIndex + 1}/
+                {Math.max(frames.length, series.frame_count)}
+                {activeFrame ? ` · z = ${activeFrame.ipp_z.toFixed(1)} mm` : ''} · W:{hudWw} L:
+                {hudWc}
+              </div>
             </div>
           </div>
-        </div>
-      ) : (
-        <div className="viewport-stage mode-mpr">
-          <div className="viewport-cell">
-            <div
-              ref={axialElRef}
-              className="viewport-canvas-host"
-              aria-label="Axial MPR Viewport"
-              onContextMenu={(e) => e.preventDefault()}
-            />
-            <div className="viewport-hud">Axial · W:{hudWw} L:{hudWc}</div>
+        ) : (
+          <div className="viewport-stage mode-mpr">
+            <div className="viewport-cell">
+              <div
+                ref={axialElRef}
+                role="region"
+                className="viewport-canvas-host"
+                aria-label="Axial MPR Viewport"
+                onContextMenu={(e) => e.preventDefault()}
+              />
+              <div className="viewport-hud">Axial · W:{hudWw} L:{hudWc}</div>
+            </div>
+            <div className="viewport-cell">
+              <div
+                ref={sagittalElRef}
+                role="region"
+                className="viewport-canvas-host"
+                aria-label="Sagittal MPR Viewport"
+                onContextMenu={(e) => e.preventDefault()}
+              />
+              <div className="viewport-hud">Sagittal</div>
+            </div>
+            <div className="viewport-cell">
+              <div
+                ref={coronalElRef}
+                role="region"
+                className="viewport-canvas-host"
+                aria-label="Coronal MPR Viewport"
+                onContextMenu={(e) => e.preventDefault()}
+              />
+              <div className="viewport-hud">Coronal</div>
+            </div>
           </div>
-          <div className="viewport-cell">
-            <div
-              ref={sagittalElRef}
-              className="viewport-canvas-host"
-              aria-label="Sagittal MPR Viewport"
-              onContextMenu={(e) => e.preventDefault()}
-            />
-            <div className="viewport-hud">Sagittal</div>
-          </div>
-          <div className="viewport-cell">
-            <div
-              ref={coronalElRef}
-              className="viewport-canvas-host"
-              aria-label="Coronal MPR Viewport"
-              onContextMenu={(e) => e.preventDefault()}
-            />
-            <div className="viewport-hud">Coronal</div>
-          </div>
-        </div>
-      )}
+        )}
+
+        {showSimilar && (
+          <aside className="similar-panel scroller" aria-label="Similar Slices">
+            <div className="similar-panel-header">
+              <h2 className="similar-panel-title">Similar Slices</h2>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setShowSimilar(false)}
+              >
+                Close
+              </button>
+            </div>
+            <p className="similar-panel-sub">
+              768-d Lance cosine KNN from Slice #{activeFrame?.instance_number ?? sliceIndex + 1}
+            </p>
+            {similarError && (
+              <div role="alert" className="similar-status">
+                {similarError}
+              </div>
+            )}
+            {!similarLoading && !similarError && similarHits.length === 0 && (
+              <p className="similar-status">No similar slices indexed.</p>
+            )}
+            <ul className="similar-list">
+              {similarHits.map((hit) => (
+                <li key={`${hit.series_instance_uid}:${hit.sop_instance_uid}:${hit.frame_number}`}>
+                  <button
+                    type="button"
+                    className="similar-hit-btn"
+                    onClick={() => void handleSelectSimilarHit(hit)}
+                  >
+                    <div className="similar-hit-top">
+                      <span className="similar-hit-label">
+                        [{hit.modality}] Slice #{hit.instance_number}
+                      </span>
+                      <span className="similar-score-badge">
+                        {(Math.max(0, hit.similarity) * 100).toFixed(1)}%
+                      </span>
+                    </div>
+                    <div className="similar-hit-meta">
+                      z = {hit.ipp_z.toFixed(1)} mm · {hit.series_description}
+                    </div>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </aside>
+        )}
+      </div>
 
       <div className="slice-scrubber">
         {viewMode === 'stack' && frames.length > 1 && (

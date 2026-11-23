@@ -2,11 +2,17 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use dicom_lance::api::build_router;
+use axum::routing::post;
+use axum::{Json, Router};
+use dicom_lance::api::{build_router, seed_phantoms_into_store};
+use dicom_lance::embedding::{Embedder, HttpEmbedder};
 use dicom_lance::phantom::{
     generate_phantom_dicom_files, CT_DIM, CT_SERIES_UID, CT_SLICES, CT_STUDY_UID, MR_SLICES,
 };
-use dicom_lance::store::{DicomLanceStore, StoreStats};
+use dicom_lance::schema::EMBEDDING_DIM;
+use dicom_lance::store::{
+    parse_storage_root, DicomLanceStore, SearchMode, StoreStats,
+};
 use http_body_util::BodyExt;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -590,4 +596,195 @@ async fn qido_rs_upload_directory_ingest_and_duplicate_frames() {
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0], parts[1]);
     assert_eq!(parts[0].len(), CT_DIM * CT_DIM * 2);
+}
+
+#[tokio::test]
+async fn hybrid_vector_search_similar_slices_and_dataset_cache() {
+    let tmp = TempDir::new().unwrap();
+    let store = Arc::new(DicomLanceStore::new(tmp.path()));
+    let report = seed_phantoms_into_store(&store).await.unwrap();
+    assert_eq!(report.series_ingested, 3);
+    assert_eq!(report.frames_ingested, CT_SLICES + MR_SLICES);
+
+    let app = build_router(store.clone(), None);
+
+    // 1. Subword vector recall: "nodular" has zero exact BM25 token match for "nodule",
+    // yet 768-d multimodal char-4gram embeddings recall Chest CT / Lung-RADS SR.
+    for mode in ["vector", "hybrid"] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/search?q=nodular&mode={mode}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["mode"], mode);
+        let studies = body["studies"].as_array().unwrap();
+        assert!(
+            !studies.is_empty(),
+            "expected non-empty {mode} results for subword query"
+        );
+        assert_eq!(studies[0]["patient_name"], "Rivera^Elena");
+    }
+
+    // Explicit BM25 mode returns only BM25 keyword matches
+    let bm25_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/search?q=spiculated&mode=bm25")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bm25_res.status(), StatusCode::OK);
+    let bm25_body: serde_json::Value =
+        serde_json::from_slice(&bm25_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(bm25_body["mode"], "bm25");
+    assert_eq!(bm25_body["studies"][0]["patient_name"], "Rivera^Elena");
+
+    // 2. Find Similar Slices via 768-d Cosine KNN on Chest CT nodule slice 23
+    let nodule_sop = format!("{CT_SERIES_UID}.23");
+    let sim_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/instances/{nodule_sop}/frames/1/similar?limit=5"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sim_res.status(), StatusCode::OK);
+    let sim_json: serde_json::Value =
+        serde_json::from_slice(&sim_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let hits = sim_json["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 5);
+    for hit in hits {
+        assert_eq!(hit["series_instance_uid"], CT_SERIES_UID);
+        assert_ne!(hit["sop_instance_uid"], nodule_sop);
+        let sim = hit["similarity"].as_f64().unwrap();
+        assert!(sim > 0.85, "expected high intra-series cosine similarity, got {sim}");
+        let inst = hit["instance_number"].as_i64().unwrap();
+        assert!(
+            (inst - 23).abs() <= 6,
+            "expected close axial neighbor near slice 23, got slice {inst}"
+        );
+    }
+
+    // 3. Verify dataset handle caching increments hits and refreshes atomically after ingest
+    let (s_before, f_before) = store.cache_hits();
+    let _ = store.get_series_wado_metadata(CT_STUDY_UID, CT_SERIES_UID).await.unwrap();
+    let _ = store
+        .read_frame_blobs(CT_STUDY_UID, CT_SERIES_UID, &nodule_sop, &[1], None)
+        .await
+        .unwrap();
+    let _ = store.get_stats().await.unwrap();
+    let (s_after, f_after) = store.cache_hits();
+    assert!(s_after > s_before, "expected series cache hit increment");
+    assert!(f_after > f_before, "expected frames cache hit increment");
+
+    let stats_v1 = store.get_stats().await.unwrap();
+    assert_eq!(stats_v1.embedder, "local-multimodal-768");
+    let _ = seed_phantoms_into_store(&store).await.unwrap();
+    let stats_v2 = store.get_stats().await.unwrap();
+    assert!(stats_v2.series_dataset.version > stats_v1.series_dataset.version);
+    assert!(stats_v2.frames_dataset.version > stats_v1.frames_dataset.version);
+
+    store.invalidate_cache().await;
+    let stats_reopened = store.get_stats().await.unwrap();
+    assert_eq!(stats_reopened.series_dataset.version, stats_v2.series_dataset.version);
+
+    // 4. Verify HttpEmbedder against an ephemeral OpenAI-compatible mock endpoint
+    let mock_router = Router::new().route(
+        "/v1/embeddings",
+        post(|headers: axum::http::HeaderMap, Json(payload): Json<serde_json::Value>| async move {
+            let auth = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert_eq!(auth, "Bearer test-api-key");
+            assert_eq!(payload["model"], "biomed-clip-test");
+            let mut vec = vec![0.0_f32; 64];
+            vec[0] = 3.0;
+            vec[1] = 4.0;
+            Json(serde_json::json!({
+                "data": [{ "embedding": vec }]
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_handle = tokio::spawn(async move {
+        axum::serve(listener, mock_router).await.unwrap();
+    });
+
+    let http_embedder = HttpEmbedder::new(
+        format!("http://{addr}/v1/embeddings"),
+        Some("test-api-key".to_string()),
+        "biomed-clip-test".to_string(),
+    );
+    let emb = http_embedder.embed_text("pulmonary nodule").await.unwrap();
+    assert_eq!(emb.len(), EMBEDDING_DIM as usize);
+    let norm: f32 = emb.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-4);
+    assert!((emb[0] - 0.6).abs() < 1e-4);
+    assert!((emb[1] - 0.8).abs() < 1e-4);
+    srv_handle.abort();
+}
+
+#[tokio::test]
+async fn remote_shared_memory_uri_end_to_end() {
+    if cfg!(not(feature = "cloud-s3")) {
+        let s3_err = parse_storage_root("s3://clinical-dicom-bucket/archive").unwrap_err();
+        assert!(
+            s3_err.to_string().contains("cloud-s3"),
+            "expected helpful cloud-s3 build hint, got: {s3_err}"
+        );
+    }
+
+    let remote_uri = "shared-memory://dicom-lance-integration/v2-suite";
+    let store = Arc::new(DicomLanceStore::from_uri(remote_uri).unwrap());
+    assert!(store.local_root_dir().is_none());
+    assert!(store.storage_root().is_remote());
+
+    let report = seed_phantoms_into_store(&store).await.unwrap();
+    assert_eq!(report.series_ingested, 3);
+    assert_eq!(report.frames_ingested, CT_SLICES + MR_SLICES);
+
+    let stats = store.get_stats().await.unwrap();
+    assert_eq!(stats.storage_uri, remote_uri);
+    assert_eq!(stats.frames_dataset.storage_version, "2.2");
+    assert_eq!(stats.blob_v2_kind_sample.as_deref(), Some("Packed"));
+
+    let hybrid = store
+        .search_series_with_mode(Some("ring-enhancing"), None, None, 10, SearchMode::Hybrid)
+        .await
+        .unwrap();
+    assert_eq!(hybrid.len(), 1);
+    assert_eq!(hybrid[0].patient_name, "Chen^Marcus");
+
+    let nodule_sop = format!("{CT_SERIES_UID}.23");
+    let blobs = store
+        .read_frame_blobs(CT_STUDY_UID, CT_SERIES_UID, &nodule_sop, &[1], None)
+        .await
+        .unwrap();
+    assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[0].bytes.len(), CT_DIM * CT_DIM * 2);
+
+    let sim_hits = store
+        .find_similar_frames(CT_STUDY_UID, CT_SERIES_UID, &nodule_sop, 1, 4, true)
+        .await
+        .unwrap();
+    assert_eq!(sim_hits.len(), 4);
+    assert!(sim_hits.iter().all(|h| h.series_instance_uid == CT_SERIES_UID));
 }

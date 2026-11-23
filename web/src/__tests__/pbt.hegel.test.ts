@@ -48,8 +48,9 @@ describe('Hegel PBT — frontend helpers & Cornerstone frame mapping', () => {
           gs.fromRegex('[A-Z]{2,4}'),
         ),
       );
+      const mode = tc.draw(gs.sampledFrom(['hybrid', 'bm25', 'vector'] as const));
 
-      const urlStr = buildSearchUrl(query, modality);
+      const urlStr = buildSearchUrl(query, modality, mode);
       expect(urlStr.startsWith('/api/search')).toBe(true);
       const parsed = new URL(urlStr, 'http://localhost');
       expect(parsed.pathname).toBe('/api/search');
@@ -62,6 +63,8 @@ describe('Hegel PBT — frontend helpers & Cornerstone frame mapping', () => {
       } else {
         expect(parsed.searchParams.get('modality')).toBeNull();
       }
+
+      expect(parsed.searchParams.get('mode')).toBe(mode === 'hybrid' ? null : mode);
     });
   });
 

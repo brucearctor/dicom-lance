@@ -414,18 +414,122 @@ select:focus-visible {
 
 .viewer-toolbar .btn[aria-pressed="true"],
 .viewer-toolbar .btn-primary {
-  background-color: #0284c7;
+  background-color: #0369a1;
   color: #ffffff;
   border-color: #38bdf8;
+}
+
+.viewport-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
 }
 
 .viewport-stage {
   position: relative;
   flex: 1;
+  min-width: 0;
   min-height: 0;
   display: grid;
   padding: 0.5rem;
   gap: 0.5rem;
+}
+
+.similar-panel {
+  width: 280px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  background-color: #0f172a;
+  color: #f8fafc;
+  border-left: 1px solid #334155;
+  overflow-y: auto;
+}
+
+.similar-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.similar-panel-title {
+  margin: 0;
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: #f8fafc;
+}
+
+.similar-panel-sub,
+.similar-status {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #cbd5e1;
+}
+
+.similar-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.similar-hit-btn {
+  width: 100%;
+  min-height: 44px;
+  padding: 0.5rem 0.6rem;
+  text-align: left;
+  border-radius: 0.45rem;
+  border: 1px solid #475569;
+  background-color: #1e293b;
+  color: #f8fafc;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.similar-hit-btn:hover {
+  border-color: #38bdf8;
+  background-color: #273449;
+}
+
+.similar-hit-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.similar-hit-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #f8fafc;
+}
+
+.similar-score-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  background-color: #1e3a5f;
+  color: #bae6fd;
+  border: 1px solid #38bdf8;
+}
+
+.similar-hit-meta {
+  font-size: 0.75rem;
+  color: #cbd5e1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .viewport-stage.mode-stack {
@@ -580,6 +684,15 @@ dialog.upload-dialog::backdrop {
     max-height: 40vh;
     border-right: none;
     border-bottom: 1px solid var(--border-color);
+  }
+  .viewport-body {
+    flex-direction: column;
+  }
+  .similar-panel {
+    width: 100%;
+    max-height: 220px;
+    border-left: none;
+    border-top: 1px solid #334155;
   }
   .viewport-stage.mode-mpr {
     grid-template-columns: 1fr;

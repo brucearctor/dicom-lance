@@ -13,8 +13,9 @@ use dicom_lance::api::{
 use dicom_lance::dicom_ingest::{
     extract_sr_text, parse_dicom_instances, render_thumbnail_png, slice_normal_projection,
 };
-use dicom_lance::schema::FrameRecord;
-use dicom_lance::store::{validate_sql_literal, DicomLanceStore};
+use dicom_lance::embedding::{rrf_fuse, Embedder, LocalMultimodalEmbedder};
+use dicom_lance::schema::{FrameRecord, SeriesRecord, EMBEDDING_DIM};
+use dicom_lance::store::{parse_storage_root, validate_sql_literal, DicomLanceStore};
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 use hegel::generators as gs;
 use hegel::{Settings, TestCase};
@@ -667,4 +668,208 @@ fn pbt_lance_blob_range_oracle_and_merge_idempotency() {
     })
     .settings(Settings::new().test_cases(15))
     .run();
+}
+
+fn l2_norm(vec: &[f32]) -> f32 {
+    vec.iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        .sqrt() as f32
+}
+
+#[test]
+fn pbt_local_embedder_unit_norm_and_determinism() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let embedder = LocalMultimodalEmbedder;
+
+    hegel::Hegel::new(|tc: TestCase| {
+        let query = tc.draw(gs::text().max_size(128));
+        let v1 = rt.block_on(embedder.embed_text(&query)).unwrap();
+        let v2 = rt.block_on(embedder.embed_text(&query)).unwrap();
+        assert_eq!(v1.len(), EMBEDDING_DIM as usize);
+        assert_eq!(v1, v2);
+        assert!(v1.iter().all(|v| v.is_finite()));
+        assert!(
+            (l2_norm(&v1) - 1.0).abs() < 1e-4,
+            "embed_text norm was {}",
+            l2_norm(&v1)
+        );
+
+        let valid_mode = tc.draw(gs::booleans());
+        let (rows, cols, bits, pixel_bytes) = if valid_mode {
+            let r = tc.draw(gs::integers::<i32>().min_value(1).max_value(16));
+            let c = tc.draw(gs::integers::<i32>().min_value(1).max_value(16));
+            let b = tc.draw(gs::sampled_from(&[8i32, 16, 32]));
+            let need = (r as usize) * (c as usize) * (b as usize).div_ceil(8);
+            let seed = tc.draw(gs::binary().min_size(1).max_size(32));
+            let mut buf = Vec::with_capacity(need);
+            for i in 0..need {
+                buf.push(seed[i % seed.len()]);
+            }
+            (r, c, b, buf)
+        } else {
+            let r = tc.draw(gs::integers::<i32>().min_value(-2).max_value(16));
+            let c = tc.draw(gs::integers::<i32>().min_value(-2).max_value(16));
+            let b = tc.draw(gs::sampled_from(&[0i32, 8, 16, 24, 32]));
+            let buf = tc.draw(gs::binary().max_size(128));
+            (r, c, b, buf)
+        };
+
+        let frame = FrameRecord {
+            study_instance_uid: "1.2.3".to_string(),
+            series_instance_uid: "1.2.3.1".to_string(),
+            sop_instance_uid: "1.2.3.1.1".to_string(),
+            sop_class_uid: uids::CT_IMAGE_STORAGE.to_string(),
+            instance_number: 1,
+            frame_number: 1,
+            slice_sort_index: 0,
+            rows,
+            columns: cols,
+            samples_per_pixel: 1,
+            bits_allocated: bits,
+            bits_stored: bits.max(1),
+            high_bit: (bits - 1).max(0),
+            pixel_representation: tc.draw(gs::integers::<i32>().min_value(0).max_value(1)),
+            photometric_interpretation: "MONOCHROME2".to_string(),
+            transfer_syntax_uid: uids::EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
+            rescale_slope: tc.draw(gs::floats::<f64>()),
+            rescale_intercept: tc.draw(gs::floats::<f64>()),
+            window_center: tc.draw(gs::floats::<f64>()),
+            window_width: tc.draw(gs::floats::<f64>()),
+            slice_location: 0.0,
+            slice_thickness: 1.5,
+            pixel_spacing_row_mm: 0.75,
+            pixel_spacing_col_mm: 0.75,
+            ipp_x: 0.0,
+            ipp_y: 0.0,
+            ipp_z: 0.0,
+            iop: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            dicom_json_header: "{}".to_string(),
+            frame_embedding: None,
+            pixel_bytes,
+        };
+
+        let f1 = rt.block_on(embedder.embed_frame(&frame, &query)).unwrap();
+        let f2 = rt.block_on(embedder.embed_frame(&frame, &query)).unwrap();
+        assert_eq!(f1.len(), EMBEDDING_DIM as usize);
+        assert_eq!(f1, f2);
+        assert!(f1.iter().all(|v| v.is_finite()));
+        assert!((l2_norm(&f1) - 1.0).abs() < 1e-4);
+
+        let series = SeriesRecord {
+            study_instance_uid: "1.2.3".to_string(),
+            series_instance_uid: "1.2.3.1".to_string(),
+            patient_id: "PBT".to_string(),
+            patient_name: "Hegel".to_string(),
+            accession_number: String::new(),
+            study_date: String::new(),
+            study_description: "Test".to_string(),
+            modality: "CT".to_string(),
+            body_part_examined: "CHEST".to_string(),
+            series_number: 1,
+            series_description: query.clone(),
+            instance_count: 1,
+            frame_count: if valid_mode { 1 } else { 0 },
+            rows: rows.max(0),
+            columns: cols.max(0),
+            spacing_x_mm: 1.0,
+            spacing_y_mm: 1.0,
+            spacing_z_mm: 1.0,
+            window_center_default: 40.0,
+            window_width_default: 400.0,
+            is_volumetric: false,
+            sr_text: query.clone(),
+            searchable_text: query,
+            series_embedding: None,
+            thumbnail_png: None,
+            updated_at_micros: 0,
+        };
+        let empty_s = rt.block_on(embedder.embed_series(&series, &[])).unwrap();
+        assert_eq!(empty_s.len(), EMBEDDING_DIM as usize);
+        assert!(empty_s.iter().all(|v| v.is_finite()));
+        assert!((l2_norm(&empty_s) - 1.0).abs() < 1e-4);
+
+        let frame_slice = [frame];
+        let s1 = rt
+            .block_on(embedder.embed_series(&series, &frame_slice))
+            .unwrap();
+        assert_eq!(s1.len(), EMBEDDING_DIM as usize);
+        assert!(s1.iter().all(|v| v.is_finite()));
+        assert!((l2_norm(&s1) - 1.0).abs() < 1e-4);
+    })
+    .settings(Settings::new().test_cases(35))
+    .run();
+}
+
+#[hegel::test]
+fn pbt_rrf_fusion_monotonicity_and_symmetry(tc: TestCase) {
+    let bm25_ids = tc.draw(gs::vecs(gs::from_regex(r"doc_[a-h]")).max_size(12));
+    let vec_ids = tc.draw(gs::vecs(gs::from_regex(r"doc_[a-h]")).max_size(12));
+    let k = tc.draw(hegel::one_of!(
+        gs::floats::<f32>().min_value(1.0).max_value(200.0),
+        gs::sampled_from(vec![0.0f32, -10.0, f32::NAN, f32::INFINITY]),
+    ));
+
+    let fused_ab = rrf_fuse(&bm25_ids, &vec_ids, k);
+    let fused_ba = rrf_fuse(&vec_ids, &bm25_ids, k);
+
+    // Exact symmetry and deterministic tie-breaking
+    assert_eq!(fused_ab, fused_ba);
+
+    for win in fused_ab.windows(2) {
+        let (id_a, sc_a) = &win[0];
+        let (id_b, sc_b) = &win[1];
+        assert!(sc_a.is_finite() && *sc_a > 0.0);
+        assert!(sc_b.is_finite() && *sc_b > 0.0);
+        assert!(
+            *sc_a > *sc_b || ((*sc_a - *sc_b).abs() == 0.0 && id_a < id_b),
+            "expected descending score / ascending ID ordering: {:?} vs {:?}",
+            win[0],
+            win[1]
+        );
+    }
+
+    // Document appearing at rank 1 in both lists strictly outranks document at rank 1 in one list
+    let list_a = vec!["shared".to_string(), "only_a".to_string()];
+    let list_b = vec!["only_b".to_string(), "shared".to_string()];
+    let mono = rrf_fuse(&list_a, &list_b, 60.0);
+    assert_eq!(mono[0].0, "shared");
+    assert!(mono[0].1 > mono[1].1);
+}
+
+#[hegel::test]
+fn pbt_storage_root_uri_normalization(tc: TestCase) {
+    let scheme = tc.draw(gs::sampled_from(&["shared-memory", "memory", "file"]));
+    let authority = tc.draw(gs::from_regex(r"[a-z0-9-]{2,14}"));
+    let prefix = tc.draw(gs::from_regex(r"[a-z0-9_-]{1,12}"));
+    let slashes = tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
+    let tail = "/".repeat(slashes);
+
+    if scheme == "file" {
+        let uri = format!("file:///tmp/{authority}/{prefix}{tail}");
+        let root = parse_storage_root(&uri).unwrap();
+        assert!(!root.is_remote());
+        assert!(root.local_path().is_some());
+        assert!(root.series_uri().ends_with("/lance/dicom_series.lance"));
+    } else {
+        let uri = format!("{scheme}://{authority}/{prefix}{tail}");
+        let root = parse_storage_root(&uri).unwrap();
+        assert!(root.is_remote());
+        assert!(root.local_path().is_none());
+        let s_uri = root.series_uri();
+        let f_uri = root.frames_uri();
+        assert!(!s_uri.contains("//lance/"), "unexpected //lance/ in {s_uri}");
+        assert!(!f_uri.contains("//lance/"), "unexpected //lance/ in {f_uri}");
+        assert!(s_uri.ends_with("/lance/dicom_series.lance"));
+        assert!(f_uri.ends_with("/lance/dicom_frames.lance"));
+    }
+
+    let local_raw = format!("/tmp/{authority}/{prefix}{tail}");
+    let local_root = parse_storage_root(&local_raw).unwrap();
+    assert!(!local_root.is_remote());
+    assert!(local_root.local_path().is_some());
+
+    assert!(parse_storage_root("").is_err());
+    assert!(parse_storage_root("   ").is_err());
+    assert!(parse_storage_root("shared-memory:///leading-slash").is_err());
 }

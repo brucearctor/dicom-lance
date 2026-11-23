@@ -70,6 +70,19 @@ test.describe('Live Rust + Lance v2.2 + Cornerstone3D WebGL2 E2E', () => {
     const stackStats = await sampleCanvasStats(page);
     expect(stackStats[0].buckets).toBeGreaterThanOrEqual(4);
 
+    // 2b. Find Similar Slices via live 768-d Lance cosine KNN and click-to-jump
+    const similarBtn = page.getByRole('button', { name: 'Similar Slices' });
+    await expect(similarBtn).toBeEnabled({ timeout: 15_000 });
+    await similarBtn.click();
+    const similarPanel = page.getByRole('complementary', { name: 'Similar Slices' });
+    await expect(similarPanel).toBeVisible();
+    const firstHit = similarPanel.locator('.similar-hit-btn').first();
+    await expect(firstHit).toBeVisible({ timeout: 15_000 });
+    await expect(firstHit).toContainText('%');
+    await firstHit.click();
+    await similarPanel.getByRole('button', { name: 'Close' }).click();
+    await expect(similarPanel).toBeHidden();
+
     // 3. Apply Window/Level preset and verify live MPR 3-Up (Axial / Sagittal / Coronal)
     await page.getByRole('button', { name: 'Bone (300/1500)' }).click();
     await page.getByRole('button', { name: '3D MPR' }).click();
@@ -84,8 +97,14 @@ test.describe('Live Rust + Lance v2.2 + Cornerstone3D WebGL2 E2E', () => {
       )
       .toBe(true);
 
-    // 4. Live BM25 FTS query on Lance dataset
+    // 4. Live Vector subword query ("nodular" -> Chest CT) and Hybrid query ("ring-enhancing" -> Brain MRI)
     const searchInput = page.getByRole('searchbox', { name: /search studies/i });
+    await page.getByRole('button', { name: 'Vector', exact: true }).click();
+    await searchInput.fill('nodular');
+    await page.getByRole('button', { name: 'Search', exact: true }).click();
+    await expect(page.getByText('Rivera^Elena')).toBeVisible();
+
+    await page.getByRole('button', { name: 'Hybrid', exact: true }).click();
     await searchInput.fill('ring-enhancing');
     await page.getByRole('button', { name: 'Search', exact: true }).click();
     await expect(page.getByText('Chen^Marcus')).toBeVisible();
