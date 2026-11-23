@@ -21,11 +21,17 @@ pub enum PhantomError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("dicom write error: {0}")]
-    Write(#[from] dicom_object::WriteError),
+    Write(Box<dicom_object::WriteError>),
     #[error("dicom meta error: {0}")]
     Meta(#[from] dicom_object::meta::Error),
     #[error("with_meta error: {0}")]
     WithMeta(#[from] WithMetaError),
+}
+
+impl From<dicom_object::WriteError> for PhantomError {
+    fn from(err: dicom_object::WriteError) -> Self {
+        Self::Write(Box::new(err))
+    }
 }
 
 fn put_str(obj: &mut InMemDicomObject, tag: dicom_core::Tag, vr: VR, val: &str) {

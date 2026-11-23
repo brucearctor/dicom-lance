@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -136,12 +136,15 @@ pub struct IngestReport {
     pub study_uids: Vec<String>,
 }
 
-fn validate_sql_literal(value: &str, field: &str) -> Result<String, StoreError> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 {
+pub fn validate_sql_literal(value: &str, field: &str) -> Result<String, StoreError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value != value.trim()
+        || value.contains("--")
+    {
         return Err(StoreError::InvalidInput(format!("invalid {field}")));
     }
-    if !trimmed
+    if !value
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'^' | b' '))
     {
@@ -149,7 +152,7 @@ fn validate_sql_literal(value: &str, field: &str) -> Result<String, StoreError> 
             "disallowed characters in {field}"
         )));
     }
-    Ok(trimmed.to_string())
+    Ok(value.to_string())
 }
 
 fn format_blob_kind(kind: BlobKind) -> &'static str {
@@ -702,7 +705,14 @@ impl DicomLanceStore {
         if frame_numbers.is_empty() {
             return Err(StoreError::InvalidInput("empty frame list".to_string()));
         }
-        let in_list = frame_numbers
+        let mut unique_frames = Vec::new();
+        let mut seen_frames = HashSet::new();
+        for &n in frame_numbers {
+            if seen_frames.insert(n) {
+                unique_frames.push(n);
+            }
+        }
+        let in_list = unique_frames
             .iter()
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
@@ -716,37 +726,38 @@ impl DicomLanceStore {
         ))?;
 
         let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
-        let mut matched: Vec<(i32, u64, String)> = Vec::new();
+        let mut by_frame: HashMap<i32, (u64, String)> = HashMap::new();
         for batch in batches {
             let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
             let fnums = batch["frame_number"].as_primitive::<Int32Type>();
             let tses = batch["transfer_syntax_uid"].as_string::<i32>();
             for i in 0..batch.num_rows() {
-                matched.push((fnums.value(i), row_ids.value(i), tses.value(i).to_string()));
+                by_frame.insert(
+                    fnums.value(i),
+                    (row_ids.value(i), tses.value(i).to_string()),
+                );
             }
         }
-        if matched.is_empty() {
-            return Err(StoreError::NotFound(format!(
-                "no matching frames for {sop_uid}"
-            )));
+
+        let mut requested = Vec::with_capacity(frame_numbers.len());
+        let mut unique_row_ids = Vec::new();
+        let mut seen_rids = HashSet::new();
+        for &fnum in frame_numbers {
+            let (rid, ts_uid) = by_frame.get(&fnum).ok_or_else(|| {
+                StoreError::NotFound(format!("frame {fnum} not found for {sop_uid}"))
+            })?;
+            requested.push((fnum, *rid, ts_uid.clone()));
+            if seen_rids.insert(*rid) {
+                unique_row_ids.push(*rid);
+            }
         }
 
-        // Preserve caller frame order when possible
-        matched.sort_by_key(|(fnum, _, _)| {
-            frame_numbers
-                .iter()
-                .position(|x| x == fnum)
-                .unwrap_or(usize::MAX)
-        });
-
-        let row_ids: Vec<u64> = matched.iter().map(|(_, rid, _)| *rid).collect();
         let ds_arc = Arc::new(dataset);
-        let blobs = ds_arc.take_blobs(&row_ids, "pixel_frame_blob").await?;
-
-        let mut results = Vec::with_capacity(matched.len());
-        for ((frame_number, _, ts_uid), blob_opt) in matched.into_iter().zip(blobs.into_iter()) {
+        let blobs = ds_arc.take_blobs(&unique_row_ids, "pixel_frame_blob").await?;
+        let mut cached_payloads: HashMap<u64, (String, u64, Vec<u8>)> = HashMap::new();
+        for (rid, blob_opt) in unique_row_ids.into_iter().zip(blobs) {
             let blob = blob_opt.ok_or_else(|| {
-                StoreError::NotFound(format!("null pixel blob for {sop_uid} frame {frame_number}"))
+                StoreError::NotFound(format!("null pixel blob for {sop_uid} row {rid}"))
             })?;
             let total_blob_size = blob.size();
             let blob_kind = format_blob_kind(blob.kind()).to_string();
@@ -761,12 +772,20 @@ impl DicomLanceStore {
                 }
                 None => blob.read().await?.to_vec(),
             };
+            cached_payloads.insert(rid, (blob_kind, total_blob_size, bytes));
+        }
+
+        let mut results = Vec::with_capacity(requested.len());
+        for (frame_number, rid, ts_uid) in requested {
+            let (blob_kind, total_blob_size, bytes) = cached_payloads
+                .get(&rid)
+                .ok_or_else(|| StoreError::NotFound(format!("missing blob cache for row {rid}")))?;
             results.push(FrameBlobPayload {
                 frame_number,
                 transfer_syntax_uid: ts_uid,
-                blob_kind,
-                total_blob_size,
-                bytes,
+                blob_kind: blob_kind.clone(),
+                total_blob_size: *total_blob_size,
+                bytes: bytes.clone(),
             });
         }
 

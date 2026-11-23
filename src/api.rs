@@ -39,9 +39,15 @@ pub enum ApiError {
     #[error("ingest error: {0}")]
     Ingest(#[from] IngestError),
     #[error("phantom error: {0}")]
-    Phantom(#[from] PhantomError),
+    Phantom(Box<PhantomError>),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<PhantomError> for ApiError {
+    fn from(err: PhantomError) -> Self {
+        Self::Phantom(Box::new(err))
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -52,6 +58,8 @@ impl IntoResponse for ApiError {
             ApiError::Store(StoreError::NotFound(m)) => (StatusCode::NOT_FOUND, m),
             ApiError::Store(StoreError::InvalidInput(m)) => (StatusCode::BAD_REQUEST, m),
             ApiError::Ingest(IngestError::Invalid(m)) => (StatusCode::BAD_REQUEST, m),
+            ApiError::Ingest(IngestError::Parse(e)) => (StatusCode::BAD_REQUEST, e.to_string()),
+            ApiError::Ingest(IngestError::PixelDecode(e)) => (StatusCode::BAD_REQUEST, e.to_string()),
             other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         };
         (status, Json(serde_json::json!({ "error": msg }))).into_response()
@@ -309,21 +317,52 @@ async fn ingest_directory(
     Ok(Json(report))
 }
 
-fn extract_boundary(content_type: &str) -> Option<String> {
+pub fn extract_boundary(content_type: &str) -> Option<String> {
     for part in content_type.split(';') {
         let trimmed = part.trim();
-        if let Some(rest) = trimmed.strip_prefix("boundary=") {
-            return Some(rest.trim_matches('"').to_string());
+        if let Some((key, val)) = trimmed.split_once('=') {
+            if key.trim().eq_ignore_ascii_case("boundary") {
+                let val_trimmed = val.trim();
+                let unquoted = val_trimmed
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(val_trimmed);
+                if unquoted.is_empty() || unquoted.contains(['\r', '\n']) {
+                    return None;
+                }
+                return Some(unquoted.to_string());
+            }
         }
     }
     None
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn split_multipart_related(body: &[u8], boundary: &str) -> Vec<Bytes> {
+pub fn encode_multipart_related(boundary: &str, parts: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for &(content_type, payload) in parts {
+        let part_header = format!(
+            "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+            payload.len()
+        );
+        body.extend_from_slice(part_header.as_bytes());
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+pub fn split_multipart_related(body: &[u8], boundary: &str) -> Vec<Bytes> {
+    if boundary.is_empty() || boundary.contains(['\r', '\n']) {
+        return Vec::new();
+    }
     let delim = format!("--{boundary}").into_bytes();
     let mut parts = Vec::new();
     let mut pos = 0usize;
@@ -341,7 +380,9 @@ fn split_multipart_related(body: &[u8], boundary: &str) -> Vec<Bytes> {
             start
         };
 
-        let next_delim = find_bytes(&body[header_start..], &delim)
+        let next_match = find_bytes(&body[header_start..], &delim);
+        let has_next_delim = next_match.is_some();
+        let next_delim = next_match
             .map(|r| header_start + r)
             .unwrap_or(body.len());
 
@@ -354,12 +395,14 @@ fn split_multipart_related(body: &[u8], boundary: &str) -> Vec<Bytes> {
 
         if let Some(p_start) = payload_start {
             let mut p_end = segment.len();
-            if p_end >= 2 && &segment[p_end - 2..p_end] == b"\r\n" {
-                p_end -= 2;
-            } else if p_end >= 1 && segment[p_end - 1] == b'\n' {
-                p_end -= 1;
+            if has_next_delim {
+                if p_end >= p_start + 2 && &segment[p_end - 2..p_end] == b"\r\n" {
+                    p_end -= 2;
+                } else if p_end > p_start && segment[p_end - 1] == b'\n' {
+                    p_end -= 1;
+                }
             }
-            if p_start < p_end {
+            if p_start <= p_end {
                 parts.push(Bytes::copy_from_slice(&segment[p_start..p_end]));
             }
         }
@@ -380,7 +423,10 @@ async fn stow_studies(
         .unwrap_or("");
 
     let buffers = if let Some(boundary) = extract_boundary(ct) {
-        let parts = split_multipart_related(&body, &boundary);
+        let parts: Vec<Bytes> = split_multipart_related(&body, &boundary)
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect();
         if parts.is_empty() {
             return Err(ApiError::BadRequest(
                 "STOW-RS multipart/related contained zero DICOM parts".to_string(),
@@ -497,16 +543,47 @@ async fn wado_series_metadata(
         .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
-fn parse_range_header(headers: &HeaderMap) -> Option<Range<u64>> {
-    let raw = headers.get(RANGE)?.to_str().ok()?;
-    let spec = raw.trim().strip_prefix("bytes=")?;
+pub fn parse_range_header(headers: &HeaderMap) -> Option<Range<u64>> {
+    let raw = headers.get(RANGE)?.to_str().ok()?.trim();
+    let prefix = raw.get(..6)?;
+    if !prefix.eq_ignore_ascii_case("bytes=") {
+        return None;
+    }
+    let spec = &raw[6..];
     let (start_s, end_s) = spec.split_once('-')?;
     let start = start_s.trim().parse::<u64>().ok()?;
-    let end_inclusive = end_s.trim().parse::<u64>().ok()?;
+    let end_trimmed = end_s.trim();
+    if end_trimmed.is_empty() {
+        return Some(start..u64::MAX);
+    }
+    let end_inclusive = end_trimmed.parse::<u64>().ok()?;
     if end_inclusive < start {
         return None;
     }
-    Some(start..end_inclusive + 1)
+    let end_exclusive = end_inclusive.checked_add(1)?;
+    Some(start..end_exclusive)
+}
+
+pub fn parse_frame_numbers(frames_str: &str) -> Result<Vec<i32>, ApiError> {
+    let trimmed = frames_str.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "invalid frame list: {frames_str}"
+        )));
+    }
+    let mut out = Vec::new();
+    for seg in trimmed.split(',') {
+        let n = seg.trim().parse::<i32>().map_err(|_| {
+            ApiError::BadRequest(format!("invalid frame list: {frames_str}"))
+        })?;
+        if n < 1 {
+            return Err(ApiError::BadRequest(format!(
+                "invalid frame number {n} in frame list: {frames_str}"
+            )));
+        }
+        out.push(n);
+    }
+    Ok(out)
 }
 
 async fn wado_instance_frames(
@@ -514,16 +591,7 @@ async fn wado_instance_frames(
     headers: HeaderMap,
     AxumPath((study, series, sop, frames_str)): AxumPath<(String, String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let frame_numbers: Vec<i32> = frames_str
-        .split(',')
-        .filter_map(|s| s.trim().parse::<i32>().ok())
-        .filter(|&n| n >= 1)
-        .collect();
-    if frame_numbers.is_empty() {
-        return Err(ApiError::BadRequest(format!(
-            "invalid frame list: {frames_str}"
-        )));
-    }
+    let frame_numbers = parse_frame_numbers(&frames_str)?;
 
     let byte_range = parse_range_header(&headers);
     let _accept = headers.get(ACCEPT).and_then(|v| v.to_str().ok()).unwrap_or("");
@@ -532,18 +600,23 @@ async fn wado_instance_frames(
         .read_frame_blobs(&study, &series, &sop, &frame_numbers, byte_range.clone())
         .await?;
 
-    let mut body = Vec::new();
-    for p in &payloads {
-        let part_header = format!(
-            "--{WADO_BOUNDARY}\r\nContent-Type: application/octet-stream; transfer-syntax={}\r\nContent-Length: {}\r\n\r\n",
-            p.transfer_syntax_uid,
-            p.bytes.len()
-        );
-        body.extend_from_slice(part_header.as_bytes());
-        body.extend_from_slice(&p.bytes);
-        body.extend_from_slice(b"\r\n");
-    }
-    body.extend_from_slice(format!("--{WADO_BOUNDARY}--\r\n").as_bytes());
+    let part_specs: Vec<(String, &[u8])> = payloads
+        .iter()
+        .map(|p| {
+            (
+                format!(
+                    "application/octet-stream; transfer-syntax={}",
+                    p.transfer_syntax_uid
+                ),
+                p.bytes.as_slice(),
+            )
+        })
+        .collect();
+    let part_refs: Vec<(&str, &[u8])> = part_specs
+        .iter()
+        .map(|(ct, bytes)| (ct.as_str(), *bytes))
+        .collect();
+    let body = encode_multipart_related(WADO_BOUNDARY, &part_refs);
 
     let ct_header = format!(
         "multipart/related; type=\"application/octet-stream\"; boundary=\"{WADO_BOUNDARY}\""

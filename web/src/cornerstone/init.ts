@@ -18,7 +18,8 @@ import {
   WindowLevelTool,
   ZoomTool,
 } from '@cornerstonejs/tools';
-import { buildWadoImageId, type FrameDescriptor } from '../api/client';
+import { type FrameDescriptor } from '../api/client';
+import { mapSeriesFramesToMetadata } from './seriesMapping';
 
 export type ToolMode =
   | 'WindowLevel'
@@ -70,12 +71,6 @@ export function initCornerstoneOnce(): Promise<void> {
   return initPromise;
 }
 
-function getTagString(meta: Record<string, unknown>, tag: string): string | null {
-  const entry = meta[tag] as { Value?: unknown[] } | undefined;
-  const first = entry?.Value?.[0];
-  return typeof first === 'string' ? first : null;
-}
-
 export function prepareSeriesImageIds(
   origin: string,
   studyUid: string,
@@ -83,33 +78,22 @@ export function prepareSeriesImageIds(
   metadataList: Record<string, unknown>[],
   frames: FrameDescriptor[],
 ): string[] {
-  const metaBySop = new Map<string, Record<string, unknown>>();
-  for (const item of metadataList) {
-    const sop = getTagString(item, '00080018');
-    if (sop) {
-      metaBySop.set(sop, item);
-    }
-  }
-
-  const imageIds: string[] = [];
-  for (const frame of frames) {
-    const imageId = buildWadoImageId(
-      origin,
-      studyUid,
-      seriesUid,
-      frame.sop_instance_uid,
-      frame.frame_number,
-    );
-    const meta = metaBySop.get(frame.sop_instance_uid) ?? metadataList[0];
-    if (meta) {
+  const mapped = mapSeriesFramesToMetadata(
+    origin,
+    studyUid,
+    seriesUid,
+    metadataList,
+    frames,
+  );
+  for (const item of mapped) {
+    if (item.metadata) {
       wadors.metaDataManager.add(
-        imageId,
-        meta as unknown as Parameters<typeof wadors.metaDataManager.add>[1],
+        item.imageId,
+        item.metadata as unknown as Parameters<typeof wadors.metaDataManager.add>[1],
       );
     }
-    imageIds.push(imageId);
   }
-  return imageIds;
+  return mapped.map((item) => item.imageId);
 }
 
 export function purgeCornerstoneMemory(): void {

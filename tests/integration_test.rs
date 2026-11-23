@@ -216,3 +216,378 @@ async fn end_to_end_dicom_lance_v2_2_stow_search_and_wado_rs() {
     assert_eq!(range_part.len(), 1024);
     assert_eq!(range_part, &raw_pixels[..1024]);
 }
+
+#[tokio::test]
+async fn api_error_paths_and_malformed_inputs() {
+    let tmp = TempDir::new().unwrap();
+    let store = Arc::new(DicomLanceStore::new(tmp.path()));
+    let app = build_router(store.clone(), None);
+
+    // 1. Empty STOW-RS body -> 400
+    let empty_stow = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dicomweb/studies")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_stow.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Corrupt non-DICOM upload -> 400
+    let corrupt_stow = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dicomweb/studies")
+                .header(header::CONTENT_TYPE, "application/dicom")
+                .body(Body::from(&b"not-a-valid-dicom-part10-stream"[..]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(corrupt_stow.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Seed one study so subsequent negative/range checks hit populated datasets
+    let dcm_dir = tmp.path().join("raw_phantoms");
+    generate_phantom_dicom_files(&dcm_dir).unwrap();
+    let dir_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ingest/directory")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "path": dcm_dir.to_string_lossy() }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dir_res.status(), StatusCode::OK);
+
+    let nodule_sop = format!("{CT_SERIES_UID}.23");
+
+    // 4. Invalid frame lists -> 400
+    for bad_frames in ["1,bogus", "0", "-1", "1,,2"] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dicomweb/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/instances/{nodule_sop}/frames/{bad_frames}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 for frames/{bad_frames}"
+        );
+    }
+
+    // 5. Unknown study/series/SOP -> 404
+    let miss_meta = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dicomweb/studies/1.2.3.404/series/1.2.3.404.1/metadata")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(miss_meta.status(), StatusCode::NOT_FOUND);
+
+    let miss_frame = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dicomweb/studies/1.2.3.404/series/1.2.3.404.1/instances/1.2.3.404.1.1/frames/1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(miss_frame.status(), StatusCode::NOT_FOUND);
+
+    let miss_thumb = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/series/1.2.3.404/1.2.3.404.1/thumbnail")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(miss_thumb.status(), StatusCode::NOT_FOUND);
+
+    // 6. SQL-injection attempt in UID path -> 400
+    let sqli_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/series/1.2'OR'1'='1/1.2.3/thumbnail")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sqli_res.status(), StatusCode::BAD_REQUEST);
+
+    // 7. u64::MAX Range must not panic and falls back cleanly to full frame; open-ended Range returns exact suffix
+    let full_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/instances/{nodule_sop}/frames/1"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let full_bytes = extract_multipart_part(
+        &full_res.into_body().collect().await.unwrap().to_bytes(),
+        "dicom-lance-boundary",
+    );
+    assert_eq!(full_bytes.len(), CT_DIM * CT_DIM * 2);
+
+    let umax_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/instances/{nodule_sop}/frames/1"
+                ))
+                .header(header::RANGE, format!("bytes=0-{}", u64::MAX))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(umax_res.status(), StatusCode::OK);
+    let umax_bytes = extract_multipart_part(
+        &umax_res.into_body().collect().await.unwrap().to_bytes(),
+        "dicom-lance-boundary",
+    );
+    assert_eq!(umax_bytes, full_bytes);
+
+    let open_res = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/instances/{nodule_sop}/frames/1"
+                ))
+                .header(header::RANGE, "bytes=1024-")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(open_res.status(), StatusCode::OK);
+    let open_bytes = extract_multipart_part(
+        &open_res.into_body().collect().await.unwrap().to_bytes(),
+        "dicom-lance-boundary",
+    );
+    assert_eq!(open_bytes, &full_bytes[1024..]);
+}
+
+#[tokio::test]
+async fn qido_rs_upload_directory_ingest_and_duplicate_frames() {
+    let tmp = TempDir::new().unwrap();
+    let store = Arc::new(DicomLanceStore::new(tmp.path()));
+    let app = build_router(store.clone(), None);
+
+    // 1. Directory ingest error cases
+    let bad_dir = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ingest/directory")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "path": tmp.path().join("does-not-exist").to_string_lossy() })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_dir.status(), StatusCode::BAD_REQUEST);
+
+    let empty_dir = tmp.path().join("empty_dir");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let empty_dir_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ingest/directory")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "path": empty_dir.to_string_lossy() }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_dir_res.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Upload via POST /api/ingest/upload (multipart/form-data)
+    let dcm_dir = tmp.path().join("phantoms");
+    let dcm_paths = generate_phantom_dicom_files(&dcm_dir).unwrap();
+    let boundary = "form-upload-boundary";
+    let mut form_body = Vec::new();
+    for p in dcm_paths.iter().take(5) {
+        let filename = p.file_name().unwrap().to_string_lossy();
+        let bytes = std::fs::read(p).unwrap();
+        form_body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{filename}\"\r\nContent-Type: application/dicom\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        form_body.extend_from_slice(&bytes);
+        form_body.extend_from_slice(b"\r\n");
+    }
+    form_body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+    let upload_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ingest/upload")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(form_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload_res.status(), StatusCode::OK);
+    let upload_json: serde_json::Value =
+        serde_json::from_slice(&upload_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(upload_json["series_ingested"], 1);
+    assert_eq!(upload_json["frames_ingested"], 5);
+
+    // 3. Ingest all phantoms via POST /api/ingest/directory
+    let dir_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ingest/directory")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "path": dcm_dir.to_string_lossy() }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dir_res.status(), StatusCode::OK);
+
+    // 4. QIDO-RS studies & series endpoints
+    let qido_studies_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dicomweb/studies?q=nodule&modality=CT")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(qido_studies_res.status(), StatusCode::OK);
+    let qido_studies: Vec<serde_json::Value> = serde_json::from_slice(
+        &qido_studies_res.into_body().collect().await.unwrap().to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(qido_studies.len(), 1);
+    assert_eq!(qido_studies[0]["0020000D"]["Value"][0], CT_STUDY_UID);
+    assert_eq!(
+        qido_studies[0]["00100010"]["Value"][0]["Alphabetic"],
+        "Rivera^Elena"
+    );
+    assert!(qido_studies[0]["00080061"]["Value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m == "CT"));
+
+    let qido_series_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/dicomweb/studies/{CT_STUDY_UID}/series"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(qido_series_res.status(), StatusCode::OK);
+    let qido_series: Vec<serde_json::Value> = serde_json::from_slice(
+        &qido_series_res.into_body().collect().await.unwrap().to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(qido_series.len(), 2);
+    assert_eq!(qido_series[0]["0020000E"]["Value"][0], CT_SERIES_UID);
+
+    // 5. Series PNG thumbnail endpoint
+    let thumb_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/series/{CT_STUDY_UID}/{CT_SERIES_UID}/thumbnail"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(thumb_res.status(), StatusCode::OK);
+    assert_eq!(
+        thumb_res.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/png"
+    );
+    let thumb_bytes = thumb_res.into_body().collect().await.unwrap().to_bytes();
+    let decoder = png::Decoder::new(std::io::Cursor::new(&thumb_bytes));
+    let reader = decoder.read_info().unwrap();
+    assert_eq!((reader.info().width, reader.info().height), (128, 128));
+
+    // 6. Duplicate frame request /frames/1,1 returns 2 identical multipart parts
+    let nodule_sop = format!("{CT_SERIES_UID}.23");
+    let dup_res = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/instances/{nodule_sop}/frames/1,1"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dup_res.status(), StatusCode::OK);
+    let dup_body = dup_res.into_body().collect().await.unwrap().to_bytes();
+    let parts = dicom_lance::api::split_multipart_related(&dup_body, "dicom-lance-boundary");
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], parts[1]);
+    assert_eq!(parts[0].len(), CT_DIM * CT_DIM * 2);
+}

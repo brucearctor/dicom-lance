@@ -91,10 +91,11 @@ export const WINDOW_PRESETS: WindowPreset[] = [
 ];
 
 export function computeVoiRange(wc: number, ww: number): { lower: number; upper: number } {
-  const safeWidth = Math.max(ww, 1);
+  const safeCenter = Number.isFinite(wc) ? wc : 40;
+  const safeWidth = Number.isFinite(ww) ? Math.max(ww, 1) : 400;
   return {
-    lower: wc - safeWidth / 2,
-    upper: wc + safeWidth / 2,
+    lower: safeCenter - safeWidth / 2,
+    upper: safeCenter + safeWidth / 2,
   };
 }
 

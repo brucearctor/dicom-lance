@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use tracing_subscriber::EnvFilter;
@@ -11,6 +11,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    let mut host: IpAddr = std::env::var("HOST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
     let mut port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -28,6 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--host" => {
+                if let Some(v) = args.next() {
+                    host = v.parse()?;
+                }
+            }
             "--port" => {
                 if let Some(v) = args.next() {
                     port = v.parse()?;
@@ -57,6 +66,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::new(host, port);
     dicom_lance::api::serve(addr, data_dir, Some(static_dir), seed_on_start).await
 }

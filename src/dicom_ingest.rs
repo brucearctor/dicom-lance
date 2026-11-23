@@ -50,7 +50,7 @@ fn opt_str(obj: &InMemDicomObject, tag: Tag) -> Option<String> {
     }
 }
 
-fn opt_f64_first(obj: &InMemDicomObject, tag: Tag) -> Option<f64> {
+pub fn opt_f64_first(obj: &InMemDicomObject, tag: Tag) -> Option<f64> {
     let elem = obj.element_opt(tag).ok().flatten()?;
     if let Ok(vals) = elem.to_multi_float64() {
         if let Some(&first) = vals.first() {
@@ -92,7 +92,7 @@ fn opt_i32(obj: &InMemDicomObject, tag: Tag) -> Option<i32> {
     s.split('\\').next()?.trim().parse::<i32>().ok()
 }
 
-fn extract_sr_recursive(obj: &InMemDicomObject, out: &mut Vec<String>) {
+pub fn extract_sr_recursive(obj: &InMemDicomObject, out: &mut Vec<String>) {
     let concept_name = obj
         .element_opt(tags::CONCEPT_NAME_CODE_SEQUENCE)
         .ok()
@@ -157,13 +157,13 @@ fn extract_sr_recursive(obj: &InMemDicomObject, out: &mut Vec<String>) {
     }
 }
 
-fn extract_sr_text(obj: &InMemDicomObject) -> String {
+pub fn extract_sr_text(obj: &InMemDicomObject) -> String {
     let mut lines = Vec::new();
     extract_sr_recursive(obj, &mut lines);
     lines.join("\n")
 }
 
-fn slice_normal_projection(ipp: [f64; 3], iop: [f64; 6]) -> f64 {
+pub fn slice_normal_projection(ipp: [f64; 3], iop: [f64; 6]) -> f64 {
     let rx = iop[0];
     let ry = iop[1];
     let rz = iop[2];
@@ -176,18 +176,43 @@ fn slice_normal_projection(ipp: [f64; 3], iop: [f64; 6]) -> f64 {
     ipp[0] * nx + ipp[1] * ny + ipp[2] * nz
 }
 
-fn render_thumbnail_png(frame: &FrameRecord) -> Result<Option<Vec<u8>>, IngestError> {
-    if frame.pixel_bytes.is_empty() || frame.rows <= 0 || frame.columns <= 0 {
+pub fn render_thumbnail_png(frame: &FrameRecord) -> Result<Option<Vec<u8>>, IngestError> {
+    if frame.pixel_bytes.is_empty()
+        || frame.rows <= 0
+        || frame.columns <= 0
+        || frame.samples_per_pixel <= 0
+        || frame.bits_allocated <= 0
+    {
         return Ok(None);
     }
     let rows = frame.rows as usize;
     let cols = frame.columns as usize;
-    let spp = frame.samples_per_pixel.max(1) as usize;
-    let bytes_per_sample = ((frame.bits_allocated + 7) / 8).max(1) as usize;
-    let expected = rows * cols * spp * bytes_per_sample;
+    let spp = frame.samples_per_pixel as usize;
+    let bytes_per_sample = ((frame.bits_allocated + 7) / 8) as usize;
+    if !matches!(bytes_per_sample, 1 | 2 | 4) {
+        return Ok(None);
+    }
+    let Some(expected) = rows
+        .checked_mul(cols)
+        .and_then(|v| v.checked_mul(spp))
+        .and_then(|v| v.checked_mul(bytes_per_sample))
+    else {
+        return Ok(None);
+    };
     if frame.pixel_bytes.len() < expected {
         return Ok(None);
     }
+
+    let slope = if frame.rescale_slope.is_finite() {
+        frame.rescale_slope
+    } else {
+        1.0
+    };
+    let intercept = if frame.rescale_intercept.is_finite() {
+        frame.rescale_intercept
+    } else {
+        0.0
+    };
 
     let thumb_w = 128usize;
     let thumb_h = 128usize;
@@ -195,19 +220,42 @@ fn render_thumbnail_png(frame: &FrameRecord) -> Result<Option<Vec<u8>>, IngestEr
 
     let read_scalar = |idx: usize| -> f64 {
         let base = idx * spp * bytes_per_sample;
-        let raw = if bytes_per_sample == 2 {
-            if frame.pixel_representation == 1 {
-                i16::from_le_bytes([frame.pixel_bytes[base], frame.pixel_bytes[base + 1]]) as f64
-            } else {
-                u16::from_le_bytes([frame.pixel_bytes[base], frame.pixel_bytes[base + 1]]) as f64
+        let raw = match bytes_per_sample {
+            4 => {
+                let bytes = [
+                    frame.pixel_bytes[base],
+                    frame.pixel_bytes[base + 1],
+                    frame.pixel_bytes[base + 2],
+                    frame.pixel_bytes[base + 3],
+                ];
+                if frame.pixel_representation == 1 {
+                    i32::from_le_bytes(bytes) as f64
+                } else {
+                    u32::from_le_bytes(bytes) as f64
+                }
             }
-        } else {
-            frame.pixel_bytes[base] as f64
+            2 => {
+                let bytes = [frame.pixel_bytes[base], frame.pixel_bytes[base + 1]];
+                if frame.pixel_representation == 1 {
+                    i16::from_le_bytes(bytes) as f64
+                } else {
+                    u16::from_le_bytes(bytes) as f64
+                }
+            }
+            _ => frame.pixel_bytes[base] as f64,
         };
-        raw * frame.rescale_slope + frame.rescale_intercept
+        let val = raw * slope + intercept;
+        if val.is_finite() {
+            val
+        } else {
+            0.0
+        }
     };
 
-    let (wc, ww) = if frame.window_width > 1.0 {
+    let (wc, ww) = if frame.window_center.is_finite()
+        && frame.window_width.is_finite()
+        && frame.window_width > 1.0
+    {
         (frame.window_center, frame.window_width)
     } else {
         let mut min_v = f64::INFINITY;
@@ -215,16 +263,28 @@ fn render_thumbnail_png(frame: &FrameRecord) -> Result<Option<Vec<u8>>, IngestEr
         for y in (0..rows).step_by((rows / 32).max(1)) {
             for x in (0..cols).step_by((cols / 32).max(1)) {
                 let v = read_scalar(y * cols + x);
-                if v < min_v {
-                    min_v = v;
-                }
-                if v > max_v {
-                    max_v = v;
+                if v.is_finite() {
+                    if v < min_v {
+                        min_v = v;
+                    }
+                    if v > max_v {
+                        max_v = v;
+                    }
                 }
             }
         }
-        if min_v.is_finite() && max_v > min_v {
-            ((min_v + max_v) * 0.5, (max_v - min_v).max(1.0))
+        if min_v.is_finite()
+            && max_v.is_finite()
+            && max_v > min_v
+            && (max_v - min_v).is_finite()
+        {
+            let span = max_v - min_v;
+            let mid = min_v + span * 0.5;
+            if mid.is_finite() {
+                (mid, span.max(1.0))
+            } else {
+                (40.0, 400.0)
+            }
         } else {
             (40.0, 400.0)
         }
@@ -257,6 +317,8 @@ fn render_thumbnail_png(frame: &FrameRecord) -> Result<Option<Vec<u8>>, IngestEr
 struct ParsedInstance {
     study_uid: String,
     series_uid: String,
+    sop_uid: String,
+    instance_number: i32,
     patient_id: String,
     patient_name: String,
     accession_number: String,
@@ -420,6 +482,8 @@ fn parse_single_dicom(bytes: &[u8]) -> Result<ParsedInstance, IngestError> {
     Ok(ParsedInstance {
         study_uid,
         series_uid,
+        sop_uid,
+        instance_number,
         patient_id,
         patient_name,
         accession_number,
@@ -451,7 +515,12 @@ pub fn parse_dicom_instances(raw_files: &[Bytes]) -> Result<Vec<IngestedSeries>,
     let updated_at = now_micros();
     let mut output = Vec::with_capacity(grouped.len());
 
-    for ((study_uid, series_uid), instances) in grouped {
+    for ((study_uid, series_uid), mut instances) in grouped {
+        instances.sort_by(|a, b| {
+            a.instance_number
+                .cmp(&b.instance_number)
+                .then_with(|| a.sop_uid.cmp(&b.sop_uid))
+        });
         let instance_count = instances.len() as i32;
         let first = &instances[0];
         let patient_id = first.patient_id.clone();
