@@ -9,7 +9,7 @@ jobs:
   rust-and-web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
@@ -20,7 +20,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: npm
@@ -57,3 +57,44 @@ jobs:
       - name: Run live Rust + Lance v2.2 + Cornerstone3D WebGL2 E2E
         working-directory: web
         run: npm run test:e2e:live
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --locked
+          command: check
+          command-arguments: licenses
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: dicom-lance:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test container startup, seeding, and Lance v2.2 telemetry
+        run: |
+          docker run -d --name dicom-lance-smoke -p 18095:8090 -e SEED_ON_START=true dicom-lance:ci
+          trap 'docker logs dicom-lance-smoke || true; docker rm -f dicom-lance-smoke || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:18095/healthz >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:18095/healthz
+          stats=$(curl -sf http://127.0.0.1:18095/api/stats)
+          echo "$stats"
+          echo "$stats" | jq -e '.frames_dataset.storage_version == "2.2" and .blob_v2_kind_sample == "Packed" and .series_dataset.row_count == 3 and .frames_dataset.row_count == 112'

@@ -1,5 +1,8 @@
 # dicom-lance
 
+[![CI](https://github.com/brucearctor/dicom-lance/actions/workflows/ci.yml/badge.svg)](https://github.com/brucearctor/dicom-lance/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 End-to-end **DICOM Part-10 ingestion**, **Lance v2.2 (`Blob V2`) multimodal storage + BM25 Full-Text Search**, **DICOMweb (`STOW-RS`, `QIDO-RS`, `WADO-RS`)**, and a **React 19 + TypeScript + Cornerstone3D v4** 2D Stack & 3D MPR workstation.
 
 ![dicom-lance 3D MPR Chest CT and Lung-RADS SR viewer](docs/preview.png)
