@@ -5,7 +5,7 @@ Thank you for your interest in contributing to `dicom-lance`!
 ## Prerequisites
 
 - **Rust** stable (`1.86+`) with `cargo` and `clippy`
-- **Protocol Buffers compiler** (`protoc`, needed by `lance` build scripts)
+- **Protocol Buffers compiler & headers** (`protoc`; on Debian/Ubuntu install both `protobuf-compiler` and `libprotobuf-dev` for `lance-encoding` builds)
 - **Node.js** `22+` and `npm`
 
 > Note: Keep pure-Rust dependencies in `Cargo.toml` so contributors do not need `cmake` or native C/C++ toolchains installed locally.

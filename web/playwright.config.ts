@@ -12,7 +12,7 @@ export default defineConfig({
     headless: true,
     launchOptions: {
       ...(executablePath ? { executablePath } : {}),
-      args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle'],
+      args: ['--enable-webgl', '--ignore-gpu-blocklist', '--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
     },
   },
   webServer: {
