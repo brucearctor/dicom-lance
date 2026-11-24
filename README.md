@@ -5,7 +5,7 @@
 
 End-to-end **DICOM Part-10 ingestion**, **Lance v2.2 (`Blob V2`) multimodal storage + Hybrid BM25 & 768-d Vector Search**, **DICOMweb (`STOW-RS`, `QIDO-RS`, `WADO-RS`)**, and a **React 19 + TypeScript + Cornerstone3D v4** 2D Stack & 3D MPR workstation.
 
-![dicom-lance 3D MPR Chest CT and Lung-RADS SR viewer](docs/preview.png)
+![dicom-lance Chest CT DICOM SEG Overlay and Similar Slices viewer](docs/preview.png)
 
 ## Architecture
 

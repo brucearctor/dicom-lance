@@ -1,7 +1,7 @@
 {
   "name": "dicom-lance-viewer",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "Apache-2.0",
   "description": "React 19 + TypeScript + Cornerstone3D v4 DICOMweb viewer for dicom-lance",
   "type": "module",
