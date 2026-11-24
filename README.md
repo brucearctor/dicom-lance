@@ -53,6 +53,10 @@ cargo run --release -- --seed-on-start --port 8090 --data-dir ./data
 ### Docker Quickstart
 
 ```bash
+# Run the published container image from GHCR (amd64)
+docker run --rm -p 8090:8090 -e SEED_ON_START=true ghcr.io/brucearctor/dicom-lance:latest
+
+# Or build locally
 docker build -t dicom-lance .
 docker run --rm -p 8090:8090 -e SEED_ON_START=true dicom-lance
 ```
@@ -107,8 +111,8 @@ npm run test:e2e:live
 - **Research / Non-Diagnostic Use Only**: `dicom-lance` is an experimental reference implementation. It is **not** FDA-cleared, CE-marked, or intended for primary clinical diagnosis.
 - **Network Exposure**: By default the HTTP server binds to `127.0.0.1:8090` with permissive CORS and **no built-in authentication**. Place it behind TLS, authentication, and authorization before serving real patient data or exposing it beyond localhost. See [SECURITY.md](SECURITY.md) for deployment guidance.
 
-## Contributing & License
+## Contributing, Changelog & License
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CHANGELOG.md](CHANGELOG.md) for release notes. Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
