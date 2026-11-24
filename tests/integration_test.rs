@@ -704,6 +704,22 @@ async fn hybrid_vector_search_similar_slices_and_dataset_cache() {
     let stats_reopened = store.get_stats().await.unwrap();
     assert_eq!(stats_reopened.series_dataset.version, stats_v2.series_dataset.version);
 
+    let inv_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/cache/invalidate")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inv_res.status(), StatusCode::OK);
+    let inv_stats: StoreStats =
+        serde_json::from_slice(&inv_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(inv_stats.series_dataset.version, stats_v2.series_dataset.version);
+
     // 4. Verify HttpEmbedder against an ephemeral OpenAI-compatible mock endpoint
     let mock_router = Router::new().route(
         "/v1/embeddings",

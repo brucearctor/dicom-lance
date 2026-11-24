@@ -26,6 +26,11 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: "examples/pylance-embeddings/uv.lock"
+
       - name: Run Rust Hegel PBT, integration, and error-path tests
         run: cargo test --locked
 
@@ -34,6 +39,13 @@ jobs:
 
       - name: Build Rust server binary for live E2E
         run: cargo build --locked
+
+      - name: Run Python (uv + pylance) interop lint and tests
+        working-directory: examples/pylance-embeddings
+        run: |
+          uv sync --locked
+          uv run ruff check
+          uv run pytest -v
 
       - name: Install frontend dependencies
         working-directory: web

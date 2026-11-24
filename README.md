@@ -37,6 +37,7 @@ flowchart LR
 - **Find Similar Slices**: Queries `frame_embedding` via Lance `Scanner::nearest` (`MetricType::Cosine`) at `GET /api/studies/{study}/series/{series}/instances/{sop}/frames/{frame}/similar` and provides click-to-jump slice navigation in the viewer.
 - **Pluggable Embedder**: Uses a pure-Rust deterministic `local-multimodal-768` embedder (512-d text n-gram hashing + 256-d pixel radiomics/spatial descriptors) by default, or any OpenAI-compatible `/v1/embeddings` endpoint via `--embedder-url` (`EMBEDDER_URL`), `--embedder-model`, and `--embedder-api-key`.
 - **Cloud & Remote Object Storage**: Supports local paths, `file://`, `shared-memory://`, and `memory://` out of the box via `--dataset-uri` (`DATASET_URI`). Enable native S3/GCS/Azure object stores at compile time with `--features cloud` (`cloud-s3`, `cloud-gcs`, `cloud-azure`; requires `cmake` for `aws-lc-rs`).
+- **Python / AI Ecosystem Interop (`uv` + `pylance`)**: Read `pixel_frame_blob` zero-copy into NumPy/PyTorch, compute 768-d embeddings (`RadiomicsEmbedder`, OpenAI/Ollama `/v1/embeddings`, or optional `BioMedCLIP`), write vectors back via Lance columnar evolution without rewriting Blob V2 sidecars, and hot-reload the running server via `POST /api/cache/invalidate`. See [examples/pylance-embeddings/README.md](examples/pylance-embeddings/README.md).
 
 ## Quickstart
 

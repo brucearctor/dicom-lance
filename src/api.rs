@@ -98,6 +98,7 @@ pub fn build_router(store: Arc<DicomLanceStore>, static_dir: Option<PathBuf>) ->
     let api_router = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/stats", get(get_stats))
+        .route("/api/cache/invalidate", post(invalidate_cache))
         .route("/api/search", get(search_get).post(search_post))
         .route(
             "/api/studies/{study}/series/{series}/frames-manifest",
@@ -161,6 +162,12 @@ async fn healthz() -> impl IntoResponse {
 }
 
 async fn get_stats(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let stats = state.store.get_stats().await?;
+    Ok(Json(stats))
+}
+
+async fn invalidate_cache(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    state.store.invalidate_cache().await;
     let stats = state.store.get_stats().await?;
     Ok(Json(stats))
 }
