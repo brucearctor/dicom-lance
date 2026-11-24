@@ -4,13 +4,32 @@ import { expect, test, type Page } from '@playwright/test';
 const STUDY_UID = '1.2.826.0.1.3680043.10.5432.1001';
 const CT_SERIES_UID = '1.2.826.0.1.3680043.10.5432.1001.1';
 const SR_SERIES_UID = '1.2.826.0.1.3680043.10.5432.1001.2';
+const SEG_SERIES_UID = '1.2.826.0.1.3680043.10.5432.1001.3';
 const SOP_UID = `${CT_SERIES_UID}.1`;
+const SEG_SOP_UID = `${SEG_SERIES_UID}.1`;
 
 // 1x1 transparent PNG
 const TINY_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
   'base64',
 );
+
+function buildSyntheticSegMaskMultipart(rows = 64, cols = 64): Buffer {
+  const maskBytes = Buffer.alloc(rows * cols);
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const dx = x - cols / 2;
+      const dy = y - rows / 2;
+      maskBytes[y * cols + x] = dx * dx + dy * dy < 144 ? 255 : 0;
+    }
+  }
+  const boundary = 'dicom-lance-boundary';
+  const head = Buffer.from(
+    `--${boundary}\r\nContent-Type: application/octet-stream; transfer-syntax=1.2.840.10008.1.2.1\r\nContent-Length: ${maskBytes.length}\r\n\r\n`,
+  );
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+  return Buffer.concat([head, maskBytes, tail]);
+}
 
 function buildSyntheticFrameMultipart(rows = 64, cols = 64): Buffer {
   const pixelBytes = Buffer.alloc(rows * cols * 2);
@@ -215,12 +234,53 @@ test.describe('DICOM on Lance Workstation (Hermetic Tier-2 E2E)', () => {
       }),
     );
 
-    await page.route('**/dicomweb/**/frames/**', (route) =>
-      route.fulfill({
+    await page.route('**/dicomweb/**/frames/**', (route) => {
+      const isSeg = route.request().url().includes(SEG_SERIES_UID);
+      return route.fulfill({
         status: 200,
         contentType:
           'multipart/related; type="application/octet-stream"; boundary="dicom-lance-boundary"',
-        body: buildSyntheticFrameMultipart(64, 64),
+        body: isSeg
+          ? buildSyntheticSegMaskMultipart(64, 64)
+          : buildSyntheticFrameMultipart(64, 64),
+      });
+    });
+
+    await page.route('**/api/studies/**/segmentations', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          study_instance_uid: STUDY_UID,
+          referenced_series_instance_uid: CT_SERIES_UID,
+          segmentations: [
+            {
+              seg_series_instance_uid: SEG_SERIES_UID,
+              seg_sop_instance_uid: SEG_SOP_UID,
+              series_description: 'RUL Spiculated Nodule AI Segmentation',
+              segmentation_type: 'BINARY',
+              referenced_series_uid: CT_SERIES_UID,
+              rows: 64,
+              columns: 64,
+              segments: [
+                {
+                  segment_number: 1,
+                  segment_label: 'RUL Nodule Solid Core',
+                  segment_description: '',
+                  color_rgba: [239, 68, 68, 145],
+                },
+              ],
+              frames: [
+                {
+                  seg_frame_number: 1,
+                  segment_number: 1,
+                  referenced_sop_instance_uid: SOP_UID,
+                  ipp: [-40, -40, 0],
+                },
+              ],
+            },
+          ],
+        }),
       }),
     );
 
@@ -288,7 +348,14 @@ test.describe('DICOM on Lance Workstation (Hermetic Tier-2 E2E)', () => {
     await page.getByRole('button', { name: 'Hybrid', exact: true }).click();
     await expect(page.getByText(/Showing 1 studies/)).toBeVisible();
 
-    // WCAG 2.2 AA accessibility audit with Similar Slices panel expanded
+    // Toggle DICOM SEG Overlay and verify overlay canvas + legend
+    const segBtn = page.getByRole('button', { name: 'SEG Overlay' });
+    await expect(segBtn).toBeEnabled({ timeout: 15_000 });
+    await segBtn.click();
+    await expect(page.getByTestId('seg-overlay-canvas')).toBeVisible();
+    await expect(page.getByText('RUL Nodule Solid Core')).toBeVisible();
+
+    // WCAG 2.2 AA accessibility audit with Similar Slices panel and SEG Overlay both expanded
     const a11yResults = await new AxeBuilder({ page })
       .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
       .options({ rules: { 'target-size': { enabled: true } } })

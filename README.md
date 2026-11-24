@@ -39,6 +39,13 @@ flowchart LR
 - **Cloud & Remote Object Storage**: Supports local paths, `file://`, `shared-memory://`, and `memory://` out of the box via `--dataset-uri` (`DATASET_URI`). Enable native S3/GCS/Azure object stores at compile time with `--features cloud` (`cloud-s3`, `cloud-gcs`, `cloud-azure`; requires `cmake` for `aws-lc-rs`).
 - **Python / AI Ecosystem Interop (`uv` + `pylance`)**: Read `pixel_frame_blob` zero-copy into NumPy/PyTorch, compute 768-d embeddings (`RadiomicsEmbedder`, OpenAI/Ollama `/v1/embeddings`, or optional `BioMedCLIP`), write vectors back via Lance columnar evolution without rewriting Blob V2 sidecars, and hot-reload the running server via `POST /api/cache/invalidate`. See [examples/pylance-embeddings/README.md](examples/pylance-embeddings/README.md).
 
+## Clinical DICOM Format Depth
+
+- **Compressed Transfer Syntaxes (`Cargo.toml`, `src/dicom_ingest.rs`)**: Zero-`cmake` decoding across **RLE Lossless** (`1.2.840.10008.1.2.5`), **JPEG Baseline/Extended/Lossless** (`1.2.840.10008.1.2.4.50`/`.51`/`.57`/`.70`), **JPEG 2000 & HTJ2K** (`1.2.840.10008.1.2.4.90`–`.93`, `.201`–`.203` via `cc`-built OpenJPEG `openjpeg-sys`), **Deflated Explicit VR Little Endian** (`1.2.840.10008.1.2.1.99`), **Deflated Image Frame Compression** (`1.2.840.10008.1.2.8.1`), and **JPEG XL Lossless/Recompression** (`1.2.840.10008.1.2.4.110`–`.112` via pure-Rust `jxl-oxide`). Optional C++ JPEG-LS support (`1.2.840.10008.1.2.4.80`/`.81`) is gated behind `--features codec-jpegls`.
+- **WADO-RS `Accept` Transfer-Syntax Negotiation (`src/codecs.rs`, `src/api.rs`)**: `GET /dicomweb/studies/{study}/series/{series}/instances/{sop}/frames/{frames}` negotiates quality-weighted (`q=...`) DICOM PS3.18 `Accept` headers for `ExplicitVRLittleEndian` (`1.2.840.10008.1.2.1`), `ImplicitVRLittleEndian` (`1.2.840.10008.1.2`), `RLELossless` (`1.2.840.10008.1.2.5` / `image/dicom-rle` via pure-Rust PackBits Annex G encoder), and `DeflatedImageFrame` (`1.2.840.10008.1.2.8.1`), returning `406 Not Acceptable` with supported transfer syntaxes when requested formats are unsupported or combined with HTTP `Range`.
+- **Enhanced Multi-Frame CT/MR (`src/dicom_ingest.rs`, `web/src/cornerstone/seriesMapping.ts`)**: Extracts Shared (`5200,9229`) and Per-Frame (`5200,9230`) Functional Groups (`PlanePositionSequence`, `PlaneOrientationSequence`, `PixelMeasuresSequence`, `FrameVOILUTSequence`, `PixelValueTransformationSequence`) for per-frame 3D normal slice sorting, `spacing_z_mm` calculation, and Cornerstone3D per-frame metadata projection.
+- **DICOM SEG Storage & Viewer Overlay (`src/seg.rs`, `src/phantom.rs`, `web/src/cornerstone/`)**: Unpacks 1-bit packed (`BitsAllocated=1`) binary segmentations into 8-bit Lance Blob V2 frames, decodes `SegmentSequence` labels and `RecommendedDisplayCIELabValue` colors to sRGB, exposes `GET /api/studies/{study}/series/{series}/segmentations`, seeds a 16-frame **RUL Spiculated Nodule DICOM SEG** phantom (`4` series / `128` frames total), excludes `SEG` planes from CT/MR slice KNN, and renders an affine-aligned translucent lesion mask & legend via **"SEG Overlay"** in the 2D Stack viewer.
+
 ## Quickstart
 
 ### Local Build
@@ -47,7 +54,7 @@ flowchart LR
 # 1. Build the TypeScript Cornerstone3D frontend
 cd web && npm install && npm run build && cd ..
 
-# 2. Run the Rust server and auto-seed the 3D CT (+ Lung-RADS SR) & Brain MRI phantoms
+# 2. Run the Rust server and auto-seed the 3D CT (+ Lung-RADS SR + RUL Nodule SEG) & Brain MRI phantoms
 cargo run --release -- --seed-on-start --port 8090 --data-dir ./data
 ```
 

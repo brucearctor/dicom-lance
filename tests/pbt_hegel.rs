@@ -3,18 +3,23 @@ use std::io::Cursor;
 use axum::http::header::RANGE;
 use axum::http::{HeaderMap, HeaderValue};
 use bytes::Bytes;
-use dicom_core::value::DataSetSequence;
+use dicom_core::value::{DataSetSequence, PixelFragmentSequence};
 use dicom_core::{DataElement, Length, PrimitiveValue, Tag, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_lance::api::{
     encode_multipart_related, extract_boundary, parse_frame_numbers, parse_range_header,
     split_multipart_related,
 };
+use dicom_lance::codecs::{
+    encode_rle_lossless_frame, negotiate_wado_accept, NegotiatedTransferSyntax, TS_DEFLATED_IMAGE_FRAME,
+    TS_EXPLICIT_VR_LE, TS_IMPLICIT_VR_LE, TS_RLE_LOSSLESS,
+};
 use dicom_lance::dicom_ingest::{
     extract_sr_text, parse_dicom_instances, render_thumbnail_png, slice_normal_projection,
 };
 use dicom_lance::embedding::{rrf_fuse, Embedder, LocalMultimodalEmbedder};
 use dicom_lance::schema::{FrameRecord, SeriesRecord, EMBEDDING_DIM};
+use dicom_lance::seg::{dicom_cielab_to_rgb, rgb_to_dicom_cielab, unpack_bitpacked_frames};
 use dicom_lance::store::{parse_storage_root, validate_sql_literal, DicomLanceStore};
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 use hegel::generators as gs;
@@ -872,4 +877,308 @@ fn pbt_storage_root_uri_normalization(tc: TestCase) {
     assert!(parse_storage_root("").is_err());
     assert!(parse_storage_root("   ").is_err());
     assert!(parse_storage_root("shared-memory:///leading-slash").is_err());
+}
+
+#[hegel::test]
+fn pbt_wado_accept_negotiation_never_panics_and_honors_q_values(tc: TestCase) {
+    // Cornerstone3D exact Accept header resolves to Explicit VR Little Endian
+    let cs = negotiate_wado_accept(Some(
+        "multipart/related; type=application/octet-stream; transfer-syntax=*",
+    ))
+    .unwrap();
+    assert_eq!(cs.syntax, NegotiatedTransferSyntax::ExplicitVrLittleEndian);
+
+    // Higher quality weight selects RLE over Explicit VR LE regardless of order
+    let prefer_rle = format!(
+        "multipart/related; type=\"application/octet-stream\"; transfer-syntax={TS_EXPLICIT_VR_LE}; q=0.4, \
+         multipart/related; type=\"image/dicom-rle\"; transfer-syntax={TS_RLE_LOSSLESS}; q=0.9"
+    );
+    assert_eq!(
+        negotiate_wado_accept(Some(&prefer_rle)).unwrap().syntax,
+        NegotiatedTransferSyntax::RleLossless
+    );
+
+    let prefer_deflate = format!(
+        "multipart/related; type=\"application/octet-stream\"; transfer-syntax={TS_DEFLATED_IMAGE_FRAME}; q=0.95, \
+         multipart/related; type=\"application/octet-stream\"; transfer-syntax={TS_IMPLICIT_VR_LE}; q=0.5"
+    );
+    assert_eq!(
+        negotiate_wado_accept(Some(&prefer_deflate)).unwrap().syntax,
+        NegotiatedTransferSyntax::DeflatedImageFrame
+    );
+
+    // Unsupported transfer syntax with no fallback yields Err -> 406
+    let unsupported_uid = tc.draw(gs::from_regex(r"1\.2\.840\.10008\.1\.2\.4\.(90|91|100|201)"));
+    let strict_unsupported = format!(
+        "multipart/related; type=\"application/octet-stream\"; transfer-syntax={unsupported_uid}"
+    );
+    assert!(negotiate_wado_accept(Some(&strict_unsupported)).is_err());
+
+    // Arbitrary strings must never panic
+    let arb = tc.draw(gs::text().max_size(160));
+    let _ = negotiate_wado_accept(Some(&arb));
+}
+
+#[hegel::test(test_cases = 25)]
+fn pbt_rle_lossless_encode_decode_round_trip(tc: TestCase) {
+    let rows = tc.draw(gs::integers::<usize>().min_value(2).max_value(24));
+    let cols = tc.draw(gs::integers::<usize>().min_value(2).max_value(24));
+    let spp = tc.draw(gs::sampled_from(&[1usize, 3]));
+    let bits = tc.draw(gs::sampled_from(&[8usize, 16]));
+    let bytes_per_sample = bits / 8;
+    let total_bytes = rows * cols * spp * bytes_per_sample;
+    let seed = tc.draw(gs::binary().min_size(1).max_size(48));
+
+    let mut raw_pixels = Vec::with_capacity(total_bytes);
+    for i in 0..total_bytes {
+        // Mix repeated runs and gradients to exercise both PackBits replicate and literal runs
+        let v = if i % 7 < 3 {
+            seed[0]
+        } else {
+            seed[i % seed.len()]
+        };
+        raw_pixels.push(v);
+    }
+
+    let encoded_fragment =
+        encode_rle_lossless_frame(&raw_pixels, rows, cols, spp, bits).unwrap();
+    assert_eq!(encoded_fragment.len() % 2, 0);
+
+    let mut obj = InMemDicomObject::new_empty();
+    let study_uid = "1.2.826.0.1.3680043.10.5432.9100";
+    let series_uid = "1.2.826.0.1.3680043.10.5432.9100.1";
+    let sop_uid = "1.2.826.0.1.3680043.10.5432.9100.1.1";
+    put_str(&mut obj, tags::STUDY_INSTANCE_UID, VR::UI, study_uid);
+    put_str(&mut obj, tags::SERIES_INSTANCE_UID, VR::UI, series_uid);
+    put_str(&mut obj, tags::SOP_INSTANCE_UID, VR::UI, sop_uid);
+    put_str(&mut obj, tags::SOP_CLASS_UID, VR::UI, uids::CT_IMAGE_STORAGE);
+    put_str(&mut obj, tags::MODALITY, VR::CS, "OT");
+    put_u16(&mut obj, tags::ROWS, rows as u16);
+    put_u16(&mut obj, tags::COLUMNS, cols as u16);
+    put_u16(&mut obj, tags::SAMPLES_PER_PIXEL, spp as u16);
+    put_u16(&mut obj, tags::PLANAR_CONFIGURATION, 0);
+    put_str(
+        &mut obj,
+        tags::PHOTOMETRIC_INTERPRETATION,
+        VR::CS,
+        if spp == 3 { "RGB" } else { "MONOCHROME2" },
+    );
+    put_u16(&mut obj, tags::BITS_ALLOCATED, bits as u16);
+    put_u16(&mut obj, tags::BITS_STORED, bits as u16);
+    put_u16(&mut obj, tags::HIGH_BIT, (bits - 1) as u16);
+    put_u16(&mut obj, tags::PIXEL_REPRESENTATION, 0);
+    obj.put_element(DataElement::new_with_len(
+        tags::PIXEL_DATA,
+        VR::OB,
+        Length::UNDEFINED,
+        PixelFragmentSequence::new(vec![], vec![encoded_fragment]),
+    ));
+
+    let file_obj = obj
+        .with_meta(
+            FileMetaTableBuilder::new()
+                .transfer_syntax(uids::RLE_LOSSLESS)
+                .media_storage_sop_class_uid(uids::CT_IMAGE_STORAGE)
+                .media_storage_sop_instance_uid(sop_uid),
+        )
+        .unwrap();
+    let mut dcm_bytes = Vec::new();
+    file_obj.write_all(&mut dcm_bytes).unwrap();
+
+    let parsed = parse_dicom_instances(&[Bytes::from(dcm_bytes)]).unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].frames.len(), 1);
+    assert_eq!(parsed[0].frames[0].pixel_bytes, raw_pixels);
+}
+
+#[hegel::test(test_cases = 20)]
+fn pbt_enhanced_multiframe_functional_groups_oblique_sorting(tc: TestCase) {
+    let n_frames = tc.draw(gs::integers::<usize>().min_value(3).max_value(7));
+    let dt = tc.draw(gs::floats::<f64>().min_value(0.5).max_value(6.0));
+    let alpha = tc.draw(
+        gs::floats::<f64>()
+            .min_value(-1.0)
+            .max_value(1.0),
+    );
+    let (sa, ca) = alpha.sin_cos();
+    // Orthonormal oblique orientation
+    let iop = [1.0, 0.0, 0.0, 0.0, ca, sa];
+    let nx = 0.0;
+    let ny = -sa;
+    let nz = ca;
+
+    let perm = tc.draw(gs::permutations((0..n_frames).collect::<Vec<_>>()));
+
+    let study_uid = "1.2.826.0.1.3680043.10.5432.9200";
+    let series_uid = "1.2.826.0.1.3680043.10.5432.9200.1";
+    let sop_uid = "1.2.826.0.1.3680043.10.5432.9200.1.1";
+
+    let mut obj = InMemDicomObject::new_empty();
+    put_str(&mut obj, tags::STUDY_INSTANCE_UID, VR::UI, study_uid);
+    put_str(&mut obj, tags::SERIES_INSTANCE_UID, VR::UI, series_uid);
+    put_str(&mut obj, tags::SOP_INSTANCE_UID, VR::UI, sop_uid);
+    put_str(
+        &mut obj,
+        tags::SOP_CLASS_UID,
+        VR::UI,
+        uids::ENHANCED_CT_IMAGE_STORAGE,
+    );
+    put_str(&mut obj, tags::MODALITY, VR::CS, "CT");
+    put_u16(&mut obj, tags::ROWS, 8);
+    put_u16(&mut obj, tags::COLUMNS, 8);
+    put_u16(&mut obj, tags::SAMPLES_PER_PIXEL, 1);
+    put_str(&mut obj, tags::PHOTOMETRIC_INTERPRETATION, VR::CS, "MONOCHROME2");
+    put_u16(&mut obj, tags::BITS_ALLOCATED, 16);
+    put_u16(&mut obj, tags::BITS_STORED, 12);
+    put_u16(&mut obj, tags::HIGH_BIT, 11);
+    put_u16(&mut obj, tags::PIXEL_REPRESENTATION, 0);
+    put_str(&mut obj, tags::NUMBER_OF_FRAMES, VR::IS, &n_frames.to_string());
+
+    let mut shared = InMemDicomObject::new_empty();
+    let mut orient = InMemDicomObject::new_empty();
+    put_str(
+        &mut orient,
+        tags::IMAGE_ORIENTATION_PATIENT,
+        VR::DS,
+        &format!("{:.6}\\{:.6}\\{:.6}\\{:.6}\\{:.6}\\{:.6}", iop[0], iop[1], iop[2], iop[3], iop[4], iop[5]),
+    );
+    shared.put_element(DataElement::new(
+        tags::PLANE_ORIENTATION_SEQUENCE,
+        VR::SQ,
+        DataSetSequence::new(vec![orient], Length::UNDEFINED),
+    ));
+    let mut measures = InMemDicomObject::new_empty();
+    put_str(&mut measures, tags::PIXEL_SPACING, VR::DS, "0.8\\0.8");
+    put_str(&mut measures, tags::SLICE_THICKNESS, VR::DS, &format!("{dt:.4}"));
+    shared.put_element(DataElement::new(
+        tags::PIXEL_MEASURES_SEQUENCE,
+        VR::SQ,
+        DataSetSequence::new(vec![measures], Length::UNDEFINED),
+    ));
+    let mut xform = InMemDicomObject::new_empty();
+    put_str(&mut xform, tags::RESCALE_INTERCEPT, VR::DS, "-1024");
+    put_str(&mut xform, tags::RESCALE_SLOPE, VR::DS, "1");
+    shared.put_element(DataElement::new(
+        tags::PIXEL_VALUE_TRANSFORMATION_SEQUENCE,
+        VR::SQ,
+        DataSetSequence::new(vec![xform], Length::UNDEFINED),
+    ));
+    obj.put_element(DataElement::new(
+        tags::SHARED_FUNCTIONAL_GROUPS_SEQUENCE,
+        VR::SQ,
+        DataSetSequence::new(vec![shared], Length::UNDEFINED),
+    ));
+
+    let mut pf_items = Vec::with_capacity(n_frames);
+    let mut raw_pixels = Vec::with_capacity(n_frames * 8 * 8 * 2);
+    for &k in &perm {
+        let t = k as f64 * dt;
+        let ipp = [10.0 + t * nx, 20.0 + t * ny, 30.0 + t * nz];
+        let mut fg = InMemDicomObject::new_empty();
+        let mut ppos = InMemDicomObject::new_empty();
+        put_str(
+            &mut ppos,
+            tags::IMAGE_POSITION_PATIENT,
+            VR::DS,
+            &format!("{:.6}\\{:.6}\\{:.6}", ipp[0], ipp[1], ipp[2]),
+        );
+        fg.put_element(DataElement::new(
+            tags::PLANE_POSITION_SEQUENCE,
+            VR::SQ,
+            DataSetSequence::new(vec![ppos], Length::UNDEFINED),
+        ));
+        let mut voi = InMemDicomObject::new_empty();
+        put_str(&mut voi, tags::WINDOW_CENTER, VR::DS, &(-500 + (k as i32) * 10).to_string());
+        put_str(&mut voi, tags::WINDOW_WIDTH, VR::DS, "1400");
+        fg.put_element(DataElement::new(
+            tags::FRAME_VOILUT_SEQUENCE,
+            VR::SQ,
+            DataSetSequence::new(vec![voi], Length::UNDEFINED),
+        ));
+        pf_items.push(fg);
+
+        let val = 500u16 + (k as u16) * 17;
+        for _ in 0..64 {
+            raw_pixels.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+
+    obj.put_element(DataElement::new(
+        tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE,
+        VR::SQ,
+        DataSetSequence::new(pf_items, Length::UNDEFINED),
+    ));
+    obj.put_element(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OW,
+        PrimitiveValue::from(raw_pixels),
+    ));
+
+    let file_obj = obj
+        .with_meta(
+            FileMetaTableBuilder::new()
+                .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+                .media_storage_sop_class_uid(uids::ENHANCED_CT_IMAGE_STORAGE)
+                .media_storage_sop_instance_uid(sop_uid),
+        )
+        .unwrap();
+    let mut dcm_bytes = Vec::new();
+    file_obj.write_all(&mut dcm_bytes).unwrap();
+
+    let parsed = parse_dicom_instances(&[Bytes::from(dcm_bytes)]).unwrap();
+    assert_eq!(parsed.len(), 1);
+    let ser = &parsed[0];
+    assert!(ser.series.is_volumetric);
+    assert!((ser.series.spacing_z_mm - dt).abs() < 1e-2);
+    assert!((ser.series.spacing_x_mm - 0.8).abs() < 1e-6);
+    assert_eq!(ser.frames.len(), n_frames);
+
+    for (sorted_idx, frame) in ser.frames.iter().enumerate() {
+        assert_eq!(frame.slice_sort_index, sorted_idx as i32);
+        assert_eq!(frame.rescale_intercept, -1024.0);
+        assert!((frame.window_center - (-500.0 + (sorted_idx as f64) * 10.0)).abs() < 1e-6);
+        let expected_v = (500u16 + (sorted_idx as u16) * 17).to_le_bytes();
+        assert_eq!(&frame.pixel_bytes[..2], &expected_v);
+    }
+}
+
+#[hegel::test]
+fn pbt_seg_bitpack_and_cielab_round_trip(tc: TestCase) {
+    let rows = tc.draw(gs::integers::<usize>().min_value(1).max_value(19));
+    let cols = tc.draw(gs::integers::<usize>().min_value(1).max_value(19));
+    let n_frames = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+
+    let total_bits = rows * cols * n_frames;
+    let bools = tc.draw(gs::vecs(gs::booleans()).min_size(total_bits).max_size(total_bits));
+    let mut packed = vec![0u8; total_bits.div_ceil(8)];
+    for (idx, &bit) in bools.iter().enumerate() {
+        if bit {
+            packed[idx / 8] |= 1u8 << (idx % 8);
+        }
+    }
+
+    let unpacked = unpack_bitpacked_frames(&packed, rows, cols, n_frames).unwrap();
+    assert_eq!(unpacked.len(), n_frames);
+    let frame_pixels = rows * cols;
+    for (f_idx, frame) in unpacked.iter().enumerate() {
+        assert_eq!(frame.len(), frame_pixels);
+        for (px_idx, &px) in frame.iter().enumerate() {
+            let expected = if bools[f_idx * frame_pixels + px_idx] { 255 } else { 0 };
+            assert_eq!(px, expected);
+        }
+    }
+
+    // Truncated buffer rejected cleanly
+    if !packed.is_empty() {
+        assert!(unpack_bitpacked_frames(&packed[..packed.len() - 1], rows, cols, n_frames).is_err());
+    }
+
+    let r = tc.draw(gs::integers::<u8>());
+    let g = tc.draw(gs::integers::<u8>());
+    let b = tc.draw(gs::integers::<u8>());
+    let lab = rgb_to_dicom_cielab(r, g, b);
+    let [r2, g2, b2] = dicom_cielab_to_rgb(lab[0], lab[1], lab[2]);
+    assert!((i16::from(r) - i16::from(r2)).abs() <= 3);
+    assert!((i16::from(g) - i16::from(g2)).abs() <= 3);
+    assert!((i16::from(b) - i16::from(b2)).abs() <= 3);
 }

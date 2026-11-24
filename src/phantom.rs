@@ -5,14 +5,18 @@ use dicom_core::{DataElement, Length, PrimitiveValue, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject, WithMetaError};
 
+use crate::seg::rgb_to_dicom_cielab;
+
 pub const CT_STUDY_UID: &str = "1.2.826.0.1.3680043.10.5432.1001";
 pub const CT_SERIES_UID: &str = "1.2.826.0.1.3680043.10.5432.1001.1";
 pub const CT_SR_SERIES_UID: &str = "1.2.826.0.1.3680043.10.5432.1001.2";
+pub const CT_SEG_SERIES_UID: &str = "1.2.826.0.1.3680043.10.5432.1001.3";
 pub const MR_STUDY_UID: &str = "1.2.826.0.1.3680043.10.5432.2001";
 pub const MR_SERIES_UID: &str = "1.2.826.0.1.3680043.10.5432.2001.1";
 
 pub const CT_SLICES: usize = 64;
 pub const CT_DIM: usize = 192;
+pub const CT_SEG_FRAMES: usize = 16;
 pub const MR_SLICES: usize = 48;
 pub const MR_DIM: usize = 192;
 
@@ -36,6 +40,32 @@ impl From<dicom_object::WriteError> for PhantomError {
 
 fn put_str(obj: &mut InMemDicomObject, tag: dicom_core::Tag, vr: VR, val: &str) {
     obj.put_element(DataElement::new(tag, vr, PrimitiveValue::from(val)));
+}
+
+fn put_u16_slice(obj: &mut InMemDicomObject, tag: dicom_core::Tag, vals: &[u16]) {
+    obj.put_element(DataElement::new(
+        tag,
+        VR::US,
+        PrimitiveValue::U16(vals.to_vec().into()),
+    ));
+}
+
+fn ct_nodule_region(x_mm: f64, y_mm: f64, z_mm: f64) -> u8 {
+    // 16 mm spiculated RUL pulmonary nodule (1 = solid core, 2 = GGO halo, 0 = outside)
+    let nx = x_mm + 56.0;
+    let ny = y_mm + 12.0;
+    let nz = z_mm + 25.0;
+    let dist = (nx * nx + ny * ny + nz * nz).sqrt();
+    let angle = ny.atan2(nx);
+    let spicule = 1.0 + 0.22 * (6.0 * angle + 0.2 * nz).cos();
+    let eff_core_r = 6.2 * spicule;
+    if dist <= eff_core_r {
+        1
+    } else if dist <= 12.5 {
+        2
+    } else {
+        0
+    }
 }
 
 fn put_u16(obj: &mut InMemDicomObject, tag: dicom_core::Tag, val: u16) {
@@ -113,17 +143,10 @@ fn ct_voxel_hu(x_mm: f64, y_mm: f64, z_mm: f64) -> f64 {
     }
 
     // Pathology: 16 mm spiculated RUL pulmonary nodule with ground-glass halo at (-56, -12, -25)
-    let nx = x_mm + 56.0;
-    let ny = y_mm + 12.0;
-    let nz = z_mm + 25.0;
-    let dist = (nx * nx + ny * ny + nz * nz).sqrt();
-    let angle = ny.atan2(nx);
-    let spicule = 1.0 + 0.22 * (6.0 * angle + 0.2 * nz).cos();
-    let eff_core_r = 6.2 * spicule;
-    if dist <= eff_core_r {
-        hu = 38.0;
-    } else if dist <= 12.5 {
-        hu = -460.0;
+    match ct_nodule_region(x_mm, y_mm, z_mm) {
+        1 => hu = 38.0,
+        2 => hu = -460.0,
+        _ => {}
     }
 
     hu
@@ -192,12 +215,14 @@ fn sr_text_item(concept_meaning: &str, text_value: &str) -> InMemDicomObject {
 pub fn generate_phantom_dicom_files(out_dir: &Path) -> Result<Vec<PathBuf>, PhantomError> {
     let ct_dir = out_dir.join("chest_ct");
     let sr_dir = out_dir.join("chest_sr");
+    let seg_dir = out_dir.join("chest_seg");
     let mr_dir = out_dir.join("brain_mr");
     std::fs::create_dir_all(&ct_dir)?;
     std::fs::create_dir_all(&sr_dir)?;
+    std::fs::create_dir_all(&seg_dir)?;
     std::fs::create_dir_all(&mr_dir)?;
 
-    let mut paths = Vec::with_capacity(CT_SLICES + 1 + MR_SLICES);
+    let mut paths = Vec::with_capacity(CT_SLICES + 2 + MR_SLICES);
 
     // 1. 64-slice Chest CT Study
     let ct_spacing = 1.25_f64;
@@ -346,6 +371,199 @@ pub fn generate_phantom_dicom_files(out_dir: &Path) -> Result<Vec<PathBuf>, Phan
         let sr_path = sr_dir.join("lung_rads_sr.dcm");
         write_dicom(sr, uids::COMPREHENSIVE_SR_STORAGE, &sr_sop, &sr_path)?;
         paths.push(sr_path);
+    }
+
+    // 2b. Bit-packed DICOM SEG for Chest CT RUL Spiculated Nodule (Core + GGO Halo)
+    {
+        let mut seg = InMemDicomObject::new_empty();
+        put_str(&mut seg, tags::PATIENT_ID, VR::LO, "PAT-ONC-001");
+        put_str(&mut seg, tags::PATIENT_NAME, VR::PN, "Rivera^Elena");
+        put_str(&mut seg, tags::ACCESSION_NUMBER, VR::SH, "ACC-CT-2026-0142");
+        put_str(&mut seg, tags::STUDY_DATE, VR::DA, "20261115");
+        put_str(
+            &mut seg,
+            tags::STUDY_DESCRIPTION,
+            VR::LO,
+            "CT Chest w/ Contrast - Pulmonary Nodule Surveillance",
+        );
+        put_str(&mut seg, tags::STUDY_INSTANCE_UID, VR::UI, CT_STUDY_UID);
+        put_str(&mut seg, tags::SERIES_INSTANCE_UID, VR::UI, CT_SEG_SERIES_UID);
+        put_str(&mut seg, tags::MODALITY, VR::CS, "SEG");
+        put_str(&mut seg, tags::BODY_PART_EXAMINED, VR::CS, "CHEST");
+        put_str(&mut seg, tags::SERIES_NUMBER, VR::IS, "3");
+        put_str(
+            &mut seg,
+            tags::SERIES_DESCRIPTION,
+            VR::LO,
+            "RUL Spiculated Nodule AI Segmentation (Core + GGO Halo)",
+        );
+        put_str(&mut seg, tags::INSTANCE_NUMBER, VR::IS, "1");
+        put_str(&mut seg, tags::SEGMENTATION_TYPE, VR::CS, "BINARY");
+        put_str(&mut seg, tags::PHOTOMETRIC_INTERPRETATION, VR::CS, "MONOCHROME2");
+        put_u16(&mut seg, tags::SAMPLES_PER_PIXEL, 1);
+        put_u16(&mut seg, tags::ROWS, CT_DIM as u16);
+        put_u16(&mut seg, tags::COLUMNS, CT_DIM as u16);
+        put_u16(&mut seg, tags::BITS_ALLOCATED, 1);
+        put_u16(&mut seg, tags::BITS_STORED, 1);
+        put_u16(&mut seg, tags::HIGH_BIT, 0);
+        put_u16(&mut seg, tags::PIXEL_REPRESENTATION, 0);
+        put_str(&mut seg, tags::NUMBER_OF_FRAMES, VR::IS, &CT_SEG_FRAMES.to_string());
+
+        let mut ref_series_item = InMemDicomObject::new_empty();
+        put_str(&mut ref_series_item, tags::SERIES_INSTANCE_UID, VR::UI, CT_SERIES_UID);
+        seg.put_element(DataElement::new(
+            tags::REFERENCED_SERIES_SEQUENCE,
+            VR::SQ,
+            DataSetSequence::new(vec![ref_series_item], Length::UNDEFINED),
+        ));
+
+        let mut seg_item_1 = InMemDicomObject::new_empty();
+        put_u16(&mut seg_item_1, tags::SEGMENT_NUMBER, 1);
+        put_str(&mut seg_item_1, tags::SEGMENT_LABEL, VR::LO, "RUL Nodule Solid Core");
+        put_str(
+            &mut seg_item_1,
+            tags::SEGMENT_DESCRIPTION,
+            VR::ST,
+            "Spiculated solid component (+38 HU)",
+        );
+        put_u16_slice(
+            &mut seg_item_1,
+            tags::RECOMMENDED_DISPLAY_CIE_LAB_VALUE,
+            &rgb_to_dicom_cielab(239, 68, 68),
+        );
+
+        let mut seg_item_2 = InMemDicomObject::new_empty();
+        put_u16(&mut seg_item_2, tags::SEGMENT_NUMBER, 2);
+        put_str(&mut seg_item_2, tags::SEGMENT_LABEL, VR::LO, "Ground-Glass Halo");
+        put_str(
+            &mut seg_item_2,
+            tags::SEGMENT_DESCRIPTION,
+            VR::ST,
+            "Perilesional ground-glass opacity (-460 HU)",
+        );
+        put_u16_slice(
+            &mut seg_item_2,
+            tags::RECOMMENDED_DISPLAY_CIE_LAB_VALUE,
+            &rgb_to_dicom_cielab(245, 158, 11),
+        );
+
+        seg.put_element(DataElement::new(
+            tags::SEGMENT_SEQUENCE,
+            VR::SQ,
+            DataSetSequence::new(vec![seg_item_1, seg_item_2], Length::UNDEFINED),
+        ));
+
+        let mut shared_item = InMemDicomObject::new_empty();
+        let mut plane_orient = InMemDicomObject::new_empty();
+        put_str(&mut plane_orient, tags::IMAGE_ORIENTATION_PATIENT, VR::DS, "1\\0\\0\\0\\1\\0");
+        shared_item.put_element(DataElement::new(
+            tags::PLANE_ORIENTATION_SEQUENCE,
+            VR::SQ,
+            DataSetSequence::new(vec![plane_orient], Length::UNDEFINED),
+        ));
+        let mut px_measures = InMemDicomObject::new_empty();
+        put_str(
+            &mut px_measures,
+            tags::PIXEL_SPACING,
+            VR::DS,
+            &format!("{ct_spacing}\\{ct_spacing}"),
+        );
+        put_str(&mut px_measures, tags::SLICE_THICKNESS, VR::DS, &format!("{ct_thickness}"));
+        shared_item.put_element(DataElement::new(
+            tags::PIXEL_MEASURES_SEQUENCE,
+            VR::SQ,
+            DataSetSequence::new(vec![px_measures], Length::UNDEFINED),
+        ));
+        seg.put_element(DataElement::new(
+            tags::SHARED_FUNCTIONAL_GROUPS_SEQUENCE,
+            VR::SQ,
+            DataSetSequence::new(vec![shared_item], Length::UNDEFINED),
+        ));
+
+        let mut frame_specs: Vec<(u8, usize)> = Vec::with_capacity(CT_SEG_FRAMES);
+        for z_idx in 20..=24 {
+            frame_specs.push((1, z_idx));
+        }
+        for z_idx in 17..=27 {
+            frame_specs.push((2, z_idx));
+        }
+        debug_assert_eq!(frame_specs.len(), CT_SEG_FRAMES);
+
+        let mut per_frame_items = Vec::with_capacity(frame_specs.len());
+        let total_bits = frame_specs.len() * CT_DIM * CT_DIM;
+        let mut packed_pixels = vec![0u8; total_bits.div_ceil(8)];
+        let mut bit_idx = 0usize;
+
+        for (target_region, z_idx) in frame_specs {
+            let z_mm = -80.0 + (z_idx as f64) * ct_thickness;
+            let ref_sop = format!("{CT_SERIES_UID}.{}", z_idx + 1);
+
+            for row in 0..CT_DIM {
+                let y_mm = ct_origin_y + (row as f64) * ct_spacing;
+                for col in 0..CT_DIM {
+                    let x_mm = ct_origin_x + (col as f64) * ct_spacing;
+                    if ct_nodule_region(x_mm, y_mm, z_mm) == target_region {
+                        packed_pixels[bit_idx / 8] |= 1u8 << (bit_idx % 8);
+                    }
+                    bit_idx += 1;
+                }
+            }
+
+            let mut fg = InMemDicomObject::new_empty();
+            let mut plane_pos = InMemDicomObject::new_empty();
+            put_str(
+                &mut plane_pos,
+                tags::IMAGE_POSITION_PATIENT,
+                VR::DS,
+                &format!("{ct_origin_x:.2}\\{ct_origin_y:.2}\\{z_mm:.2}"),
+            );
+            fg.put_element(DataElement::new(
+                tags::PLANE_POSITION_SEQUENCE,
+                VR::SQ,
+                DataSetSequence::new(vec![plane_pos], Length::UNDEFINED),
+            ));
+
+            let mut seg_id = InMemDicomObject::new_empty();
+            put_u16(&mut seg_id, tags::REFERENCED_SEGMENT_NUMBER, u16::from(target_region));
+            fg.put_element(DataElement::new(
+                tags::SEGMENT_IDENTIFICATION_SEQUENCE,
+                VR::SQ,
+                DataSetSequence::new(vec![seg_id], Length::UNDEFINED),
+            ));
+
+            let mut src_img = InMemDicomObject::new_empty();
+            put_str(&mut src_img, tags::REFERENCED_SOP_CLASS_UID, VR::UI, uids::CT_IMAGE_STORAGE);
+            put_str(&mut src_img, tags::REFERENCED_SOP_INSTANCE_UID, VR::UI, &ref_sop);
+            let mut deriv = InMemDicomObject::new_empty();
+            deriv.put_element(DataElement::new(
+                tags::SOURCE_IMAGE_SEQUENCE,
+                VR::SQ,
+                DataSetSequence::new(vec![src_img], Length::UNDEFINED),
+            ));
+            fg.put_element(DataElement::new(
+                tags::DERIVATION_IMAGE_SEQUENCE,
+                VR::SQ,
+                DataSetSequence::new(vec![deriv], Length::UNDEFINED),
+            ));
+
+            per_frame_items.push(fg);
+        }
+
+        seg.put_element(DataElement::new(
+            tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE,
+            VR::SQ,
+            DataSetSequence::new(per_frame_items, Length::UNDEFINED),
+        ));
+        seg.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from(packed_pixels),
+        ));
+
+        let seg_sop = format!("{CT_SEG_SERIES_UID}.1");
+        let seg_path = seg_dir.join("rul_nodule_seg.dcm");
+        write_dicom(seg, uids::SEGMENTATION_STORAGE, &seg_sop, &seg_path)?;
+        paths.push(seg_path);
     }
 
     // 3. 48-slice Brain MRI Study

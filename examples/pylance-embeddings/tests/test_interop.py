@@ -294,8 +294,8 @@ def test_rust_seed_python_blob_read_embed_write_and_live_reload(tmp_path: Path) 
             batch_size=32,
             reload_url=base_url,
         )
-        assert report.series_updated == 3
-        assert report.frames_updated == 112
+        assert report.series_updated == 4
+        assert report.frames_updated == 128
         assert report.reloaded_stats is not None
         assert report.reloaded_stats["series_dataset"]["version"] > v_series_before
         assert report.reloaded_stats["frames_dataset"]["version"] > v_frames_before

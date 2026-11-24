@@ -70,6 +70,37 @@ test.describe('Live Rust + Lance v2.2 + Cornerstone3D WebGL2 E2E', () => {
     const stackStats = await sampleCanvasStats(page);
     expect(stackStats[0].buckets).toBeGreaterThanOrEqual(4);
 
+    // 2a. Select Chest CT, scrub to Slice 23 (index 22, z = -25.0 mm), and verify DICOM SEG Overlay
+    await page
+      .getByRole('button', { name: /\[CT\] Axial Lung 2\.5mm RUL Spiculated Nodule/i })
+      .click();
+    await expect(page.getByText(/^CT · 192×192/)).toBeVisible();
+    const sliceSlider = page.locator('#slice-slider');
+    await sliceSlider.fill('22');
+    await expect(page.getByText(/z = -25\.0 mm/)).toBeVisible();
+
+    const segBtn = page.getByRole('button', { name: 'SEG Overlay' });
+    await expect(segBtn).toBeEnabled({ timeout: 15_000 });
+    await segBtn.click();
+    const segOverlayCanvas = page.getByTestId('seg-overlay-canvas');
+    await expect(segOverlayCanvas).toBeVisible();
+    await expect(page.getByText('RUL Nodule Solid Core')).toBeVisible();
+    await expect(page.getByText('Ground-Glass Halo')).toBeVisible();
+
+    await expect
+      .poll(
+        async () => {
+          const stats = await sampleCanvasStats(page);
+          return stats.length === 2 ? stats[1].nonBlack : 0;
+        },
+        { timeout: 15_000 },
+      )
+      .toBeGreaterThan(10);
+
+    // Toggle SEG Overlay off before verifying 3-up 3D MPR
+    await segBtn.click();
+    await expect(segOverlayCanvas).toBeHidden();
+
     // 2b. Find Similar Slices via live 768-d Lance cosine KNN and click-to-jump
     const similarBtn = page.getByRole('button', { name: 'Similar Slices' });
     await expect(similarBtn).toBeEnabled({ timeout: 15_000 });

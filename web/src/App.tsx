@@ -13,7 +13,7 @@ import {
 import { DicomWorkspace } from './cornerstone/DicomWorkspace';
 import { purgeCornerstoneMemory } from './cornerstone/init';
 
-const MODALITY_FILTERS = ['ALL', 'CT', 'MR', 'SR'];
+const MODALITY_FILTERS = ['ALL', 'CT', 'MR', 'SR', 'SEG'];
 const SEARCH_MODES: { id: SearchMode; label: string }[] = [
   { id: 'hybrid', label: 'Hybrid' },
   { id: 'bm25', label: 'BM25' },
@@ -54,8 +54,12 @@ export function App() {
           }
         }
         for (const st of studyResults) {
-          const imaging = st.series.find((s) => s.frame_count > 0);
+          const imaging = st.series.find((s) => s.frame_count > 0 && s.modality !== 'SEG');
           if (imaging) return imaging;
+        }
+        for (const st of studyResults) {
+          const anyFrames = st.series.find((s) => s.frame_count > 0);
+          if (anyFrames) return anyFrames;
         }
         return studyResults[0]?.series[0] ?? null;
       });
@@ -154,7 +158,7 @@ export function App() {
 
   const handleSeedPhantoms = async () => {
     setBusy(true);
-    setStatusMessage('Generating 3D CT + SR + Brain MRI phantoms into Lance v2.2...');
+    setStatusMessage('Generating 3D CT + SR + SEG + Brain MRI phantoms into Lance v2.2...');
     try {
       const report = await seedPhantoms();
       await refreshData(query, modality, searchMode);

@@ -22,13 +22,20 @@ import {
   computeVoiRange,
   fetchFramesManifest,
   fetchSeriesMetadata,
+  fetchSeriesSegmentations,
   fetchSimilarFrames,
   type FrameDescriptor,
+  type SegmentationMetadata,
   type SeriesSummary,
   type SimilarFrameHit,
   WINDOW_PRESETS,
 } from '../api/client';
 import { initCornerstoneOnce, prepareSeriesImageIds, type ToolMode } from './init';
+import {
+  compositeSegMasksRgba,
+  extractMultipartFirstPart,
+  findMatchingSegFrames,
+} from './segOverlay';
 
 interface DicomWorkspaceProps {
   series: SeriesSummary | null;
@@ -110,8 +117,12 @@ export function DicomWorkspace({
   const [similarLoading, setSimilarLoading] = useState<boolean>(false);
   const [similarError, setSimilarError] = useState<string | null>(null);
   const [similarHits, setSimilarHits] = useState<SimilarFrameHit[]>([]);
+  const [segmentations, setSegmentations] = useState<SegmentationMetadata[]>([]);
+  const [segOverlayEnabled, setSegOverlayEnabled] = useState<boolean>(false);
 
   const stackElRef = useRef<HTMLDivElement | null>(null);
+  const segCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const segMaskCacheRef = useRef<Map<string, Uint8Array>>(new Map());
   const axialElRef = useRef<HTMLDivElement | null>(null);
   const sagittalElRef = useRef<HTMLDivElement | null>(null);
   const coronalElRef = useRef<HTMLDivElement | null>(null);
@@ -130,6 +141,9 @@ export function DicomWorkspace({
     setShowSimilar(false);
     setSimilarHits([]);
     setSimilarError(null);
+    setSegmentations([]);
+    setSegOverlayEnabled(false);
+    segMaskCacheRef.current.clear();
   }, [series?.series_instance_uid]);
 
   useEffect(() => {
@@ -152,7 +166,7 @@ export function DicomWorkspace({
 
       try {
         await initCornerstoneOnce();
-        const [metaList, manifest] = await Promise.all([
+        const [metaList, manifest, segList] = await Promise.all([
           fetchSeriesMetadata(
             activeSeries.study_instance_uid,
             activeSeries.series_instance_uid,
@@ -161,11 +175,18 @@ export function DicomWorkspace({
             activeSeries.study_instance_uid,
             activeSeries.series_instance_uid,
           ),
+          activeSeries.modality === 'SEG'
+            ? Promise.resolve([])
+            : fetchSeriesSegmentations(
+                activeSeries.study_instance_uid,
+                activeSeries.series_instance_uid,
+              ).catch(() => []),
         ]);
 
         if (cancelled) return;
 
         setFrames(manifest);
+        setSegmentations(segList);
         const imageIds = prepareSeriesImageIds(
           window.location.origin,
           activeSeries.study_instance_uid,
@@ -388,6 +409,182 @@ export function DicomWorkspace({
   }, [mipEnabled, viewMode, series?.series_instance_uid]);
 
   const activeFrame = frames[sliceIndex];
+  const matchedSegLayers = useMemo(
+    () => findMatchingSegFrames(segmentations, activeFrame),
+    [segmentations, activeFrame],
+  );
+  const segLegendSegments = useMemo(
+    () => segmentations.flatMap((s) => s.segments),
+    [segmentations],
+  );
+
+  useEffect(() => {
+    if (!segOverlayEnabled || viewMode !== 'stack' || !series || !activeFrame) {
+      return;
+    }
+
+    let cancelled = false;
+    let latestComposite: {
+      rgba: Uint8ClampedArray;
+      rows: number;
+      cols: number;
+    } | null = null;
+
+    const drawOverlay = () => {
+      const segCanvas = segCanvasRef.current;
+      const host = stackElRef.current;
+      if (!segCanvas || !host) return;
+      const w = host.clientWidth;
+      const h = host.clientHeight;
+      if (w <= 0 || h <= 0) return;
+
+      if (segCanvas.width !== w || segCanvas.height !== h) {
+        segCanvas.width = w;
+        segCanvas.height = h;
+      }
+      const ctx = segCanvas.getContext('2d');
+      if (!ctx) return;
+
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+
+      if (!latestComposite) {
+        return;
+      }
+
+      const { rgba, rows: maskRows, cols: maskCols } = latestComposite;
+      if (maskRows <= 0 || maskCols <= 0) return;
+
+      const offscreen = document.createElement('canvas');
+      offscreen.width = maskCols;
+      offscreen.height = maskRows;
+      const octx = offscreen.getContext('2d');
+      if (!octx) return;
+      octx.putImageData(
+        new ImageData(new Uint8ClampedArray(rgba), maskCols, maskRows),
+        0,
+        0,
+      );
+
+      let usedAffine = false;
+      const vp = engineRef.current?.getViewport('STACK_AXIAL') as
+        | Types.IStackViewport
+        | undefined;
+      const imageData = vp?.getImageData()?.imageData as
+        | { indexToWorld?: (ijk: [number, number, number]) => [number, number, number] }
+        | undefined;
+
+      if (vp && imageData?.indexToWorld) {
+        const w00 = imageData.indexToWorld([-0.5, -0.5, 0]);
+        const w10 = imageData.indexToWorld([maskCols - 0.5, -0.5, 0]);
+        const w01 = imageData.indexToWorld([-0.5, maskRows - 0.5, 0]);
+        const c00 = vp.worldToCanvas(w00);
+        const c10 = vp.worldToCanvas(w10);
+        const c01 = vp.worldToCanvas(w01);
+        const a = (c10[0] - c00[0]) / maskCols;
+        const b = (c10[1] - c00[1]) / maskCols;
+        const c = (c01[0] - c00[0]) / maskRows;
+        const d = (c01[1] - c00[1]) / maskRows;
+        const det = a * d - b * c;
+        if (
+          Number.isFinite(c00[0]) &&
+          Number.isFinite(c00[1]) &&
+          Number.isFinite(det) &&
+          Math.abs(det) > 1e-4
+        ) {
+          ctx.imageSmoothingEnabled = false;
+          ctx.setTransform(a, b, c, d, c00[0], c00[1]);
+          ctx.drawImage(offscreen, 0, 0);
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          usedAffine = true;
+        }
+      }
+
+      if (!usedAffine) {
+        const scale = Math.min(w / maskCols, h / maskRows);
+        const dw = maskCols * scale;
+        const dh = maskRows * scale;
+        const dx = (w - dw) * 0.5;
+        const dy = (h - dh) * 0.5;
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(offscreen, dx, dy, dw, dh);
+      }
+    };
+
+    const loadAndDraw = async () => {
+      if (matchedSegLayers.length === 0) {
+        latestComposite = null;
+        drawOverlay();
+        return;
+      }
+
+      const maskRows = matchedSegLayers[0].seg.rows || series.rows;
+      const maskCols = matchedSegLayers[0].seg.columns || series.columns;
+      const layerInputs: Array<{
+        mask: Uint8Array;
+        colorRgba: [number, number, number, number];
+      }> = [];
+
+      for (const layer of matchedSegLayers) {
+        const cacheKey = `${layer.seg.seg_series_instance_uid}:${layer.seg.seg_sop_instance_uid}:${layer.mapping.seg_frame_number}`;
+        let mask = segMaskCacheRef.current.get(cacheKey);
+        if (!mask) {
+          const url = `/dicomweb/studies/${series.study_instance_uid}/series/${layer.seg.seg_series_instance_uid}/instances/${layer.seg.seg_sop_instance_uid}/frames/${layer.mapping.seg_frame_number}`;
+          const res = await fetch(url, {
+            headers: {
+              Accept:
+                'multipart/related; type="application/octet-stream"; transfer-syntax=1.2.840.10008.1.2.1',
+            },
+          });
+          if (!res.ok) {
+            throw new Error(`Failed to load SEG frame: ${res.status}`);
+          }
+          const ct = res.headers.get('content-type') || '';
+          const buf = new Uint8Array(await res.arrayBuffer());
+          mask = extractMultipartFirstPart(ct, buf);
+          segMaskCacheRef.current.set(cacheKey, mask);
+        }
+        if (cancelled) return;
+        layerInputs.push({ mask, colorRgba: layer.segment.color_rgba });
+      }
+
+      const rgba = compositeSegMasksRgba(maskRows, maskCols, layerInputs);
+      if (cancelled) return;
+      latestComposite = { rgba, rows: maskRows, cols: maskCols };
+      drawOverlay();
+    };
+
+    void loadAndDraw().catch((err) => {
+      if (!cancelled) {
+        setLoadError(err instanceof Error ? err.message : 'Failed to render SEG overlay');
+      }
+    });
+
+    const host = stackElRef.current;
+    const onViewportChange = () => drawOverlay();
+    host?.addEventListener(Enums.Events.CAMERA_MODIFIED, onViewportChange);
+    host?.addEventListener(Enums.Events.IMAGE_RENDERED, onViewportChange);
+    host?.addEventListener(Enums.Events.STACK_NEW_IMAGE, onViewportChange);
+    window.addEventListener('resize', onViewportChange);
+
+    return () => {
+      cancelled = true;
+      host?.removeEventListener(Enums.Events.CAMERA_MODIFIED, onViewportChange);
+      host?.removeEventListener(Enums.Events.IMAGE_RENDERED, onViewportChange);
+      host?.removeEventListener(Enums.Events.STACK_NEW_IMAGE, onViewportChange);
+      window.removeEventListener('resize', onViewportChange);
+    };
+  }, [
+    segOverlayEnabled,
+    viewMode,
+    series?.series_instance_uid,
+    series?.study_instance_uid,
+    series?.rows,
+    series?.columns,
+    sliceIndex,
+    activeFrame,
+    matchedSegLayers,
+  ]);
 
   useEffect(() => {
     if (requestedSliceIndex === null || requestedSliceIndex === undefined) return;
@@ -448,7 +645,7 @@ export function DicomWorkspace({
   };
 
   const volumetricSibling = useMemo(
-    () => siblingSeries.find((s) => s.frame_count > 0) ?? null,
+    () => siblingSeries.find((s) => s.frame_count > 0 && s.modality !== 'SEG') ?? null,
     [siblingSeries],
   );
 
@@ -626,7 +823,26 @@ export function DicomWorkspace({
           </button>
         </div>
 
-        <div className="toolbar-group" role="group" aria-label="Vector similarity search">
+        <div className="toolbar-group" role="group" aria-label="Segmentation and similarity search">
+          {segmentations.length > 0 && viewMode === 'stack' && (
+            <button
+              type="button"
+              className="btn"
+              aria-pressed={segOverlayEnabled}
+              onClick={() => setSegOverlayEnabled((prev) => !prev)}
+            >
+              SEG Overlay
+            </button>
+          )}
+          {series.modality === 'SEG' && volumetricSibling && (
+            <button
+              type="button"
+              className="btn"
+              onClick={() => onSelectSeries(volumetricSibling)}
+            >
+              View on Paired {volumetricSibling.modality}
+            </button>
+          )}
           <button
             type="button"
             className="btn"
@@ -656,6 +872,41 @@ export function DicomWorkspace({
                 aria-label="2D Stack Viewport"
                 onContextMenu={(e) => e.preventDefault()}
               />
+              {segOverlayEnabled && (
+                <>
+                  <canvas
+                    ref={segCanvasRef}
+                    className="viewport-seg-overlay"
+                    data-testid="seg-overlay-canvas"
+                    aria-hidden="true"
+                  />
+                  {segLegendSegments.length > 0 && (
+                    <div className="seg-legend" role="region" aria-label="Segmentation Legend">
+                      {segLegendSegments.map((seg) => {
+                        const isActiveOnSlice = matchedSegLayers.some(
+                          (l) => l.segment.segment_number === seg.segment_number,
+                        );
+                        return (
+                          <span
+                            key={seg.segment_number}
+                            className="seg-legend-item"
+                            data-active={isActiveOnSlice ? 'true' : 'false'}
+                          >
+                            <span
+                              className="seg-swatch"
+                              aria-hidden="true"
+                              style={{
+                                backgroundColor: `rgb(${seg.color_rgba[0]}, ${seg.color_rgba[1]}, ${seg.color_rgba[2]})`,
+                              }}
+                            />
+                            <span>{seg.segment_label}</span>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              )}
               <div className="viewport-hud">
                 {series.modality} · {series.rows}×{series.columns} · Slice {sliceIndex + 1}/
                 {Math.max(frames.length, series.frame_count)}

@@ -17,6 +17,9 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
+use crate::codecs::{
+    negotiate_wado_accept, transcode_frame_for_wado, SUPPORTED_WADO_TRANSFER_SYNTAXES,
+};
 use crate::dicom_ingest::{parse_dicom_instances, IngestError};
 use crate::phantom::{generate_phantom_dicom_files, PhantomError};
 use crate::store::{DicomLanceStore, IngestReport, SearchMode, StoreError, StudySummary};
@@ -34,6 +37,8 @@ pub enum ApiError {
     BadRequest(String),
     #[error("{0}")]
     NotFound(String),
+    #[error("{0}")]
+    NotAcceptable(String),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
     #[error("ingest error: {0}")]
@@ -52,9 +57,20 @@ impl From<PhantomError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let ApiError::NotAcceptable(msg) = self {
+            return (
+                StatusCode::NOT_ACCEPTABLE,
+                Json(serde_json::json!({
+                    "error": msg,
+                    "supported_transfer_syntaxes": SUPPORTED_WADO_TRANSFER_SYNTAXES,
+                })),
+            )
+                .into_response();
+        }
         let (status, msg) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApiError::NotAcceptable(m) => (StatusCode::NOT_ACCEPTABLE, m),
             ApiError::Store(StoreError::NotFound(m)) => (StatusCode::NOT_FOUND, m),
             ApiError::Store(StoreError::InvalidInput(m)) => (StatusCode::BAD_REQUEST, m),
             ApiError::Ingest(IngestError::Invalid(m)) => (StatusCode::BAD_REQUEST, m),
@@ -103,6 +119,10 @@ pub fn build_router(store: Arc<DicomLanceStore>, static_dir: Option<PathBuf>) ->
         .route(
             "/api/studies/{study}/series/{series}/frames-manifest",
             get(get_frames_manifest),
+        )
+        .route(
+            "/api/studies/{study}/series/{series}/segmentations",
+            get(get_series_segmentations),
         )
         .route(
             "/api/studies/{study}/series/{series}/instances/{sop}/frames/{frame}/similar",
@@ -239,6 +259,18 @@ async fn get_frames_manifest(
         .get_series_frame_descriptors(&study, &series)
         .await?;
     Ok(Json(serde_json::json!({ "frames": frames })))
+}
+
+async fn get_series_segmentations(
+    State(state): State<AppState>,
+    AxumPath((study, series)): AxumPath<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let segmentations = state.store.get_series_segmentations(&study, &series).await?;
+    Ok(Json(serde_json::json!({
+        "study_instance_uid": study,
+        "referenced_series_instance_uid": series,
+        "segmentations": segmentations,
+    })))
 }
 
 async fn get_series_thumbnail(
@@ -659,32 +691,44 @@ async fn wado_instance_frames(
     let frame_numbers = parse_frame_numbers(&frames_str)?;
 
     let byte_range = parse_range_header(&headers);
-    let _accept = headers.get(ACCEPT).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let negotiated = negotiate_wado_accept(headers.get(ACCEPT).and_then(|v| v.to_str().ok()))
+        .map_err(ApiError::NotAcceptable)?;
+    if byte_range.is_some() && negotiated.syntax.is_compressed() {
+        return Err(ApiError::NotAcceptable(
+            "HTTP Range requests require an uncompressed transfer syntax (1.2.840.10008.1.2.1)"
+                .to_string(),
+        ));
+    }
+
     let payloads = state
         .store
         .read_frame_blobs(&study, &series, &sop, &frame_numbers, byte_range.clone())
         .await?;
 
-    let part_specs: Vec<(String, &[u8])> = payloads
+    let mut encoded_parts = Vec::with_capacity(payloads.len());
+    for p in &payloads {
+        let encoded = transcode_frame_for_wado(
+            &p.bytes,
+            p.rows.max(0) as usize,
+            p.columns.max(0) as usize,
+            p.samples_per_pixel.max(0) as usize,
+            p.bits_allocated.max(0) as usize,
+            negotiated.syntax,
+            byte_range.is_some(),
+        )
+        .map_err(ApiError::NotAcceptable)?;
+        encoded_parts.push(encoded);
+    }
+
+    let part_refs: Vec<(&str, &[u8])> = encoded_parts
         .iter()
-        .map(|p| {
-            (
-                format!(
-                    "application/octet-stream; transfer-syntax={}",
-                    p.transfer_syntax_uid
-                ),
-                p.bytes.as_slice(),
-            )
-        })
-        .collect();
-    let part_refs: Vec<(&str, &[u8])> = part_specs
-        .iter()
-        .map(|(ct, bytes)| (ct.as_str(), *bytes))
+        .map(|bytes| (negotiated.part_content_type.as_str(), bytes.as_slice()))
         .collect();
     let body = encode_multipart_related(WADO_BOUNDARY, &part_refs);
 
     let ct_header = format!(
-        "multipart/related; type=\"application/octet-stream\"; boundary=\"{WADO_BOUNDARY}\""
+        "multipart/related; type=\"{}\"; boundary=\"{WADO_BOUNDARY}\"",
+        negotiated.multipart_type
     );
     Response::builder()
         .status(StatusCode::OK)

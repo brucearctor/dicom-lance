@@ -70,6 +70,32 @@ export interface SimilarFrameHit {
   distance: number;
 }
 
+export interface SegmentDescriptor {
+  segment_number: number;
+  segment_label: string;
+  segment_description: string;
+  color_rgba: [number, number, number, number];
+}
+
+export interface SegFrameMapping {
+  seg_frame_number: number;
+  segment_number: number;
+  referenced_sop_instance_uid: string | null;
+  ipp: [number, number, number];
+}
+
+export interface SegmentationMetadata {
+  seg_series_instance_uid: string;
+  seg_sop_instance_uid: string;
+  series_description: string;
+  segmentation_type: string;
+  referenced_series_uid: string | null;
+  rows: number;
+  columns: number;
+  segments: SegmentDescriptor[];
+  frames: SegFrameMapping[];
+}
+
 export interface DatasetStats {
   exists: boolean;
   version: number;
@@ -248,4 +274,19 @@ export async function fetchSimilarFrames(
   }
   const data = (await res.json()) as { hits: SimilarFrameHit[] };
   return data.hits;
+}
+
+export async function fetchSeriesSegmentations(
+  studyUid: string,
+  seriesUid: string,
+): Promise<SegmentationMetadata[]> {
+  const res = await fetch(`/api/studies/${studyUid}/series/${seriesUid}/segmentations`);
+  if (res.status === 404) {
+    return [];
+  }
+  if (!res.ok) {
+    throw new Error(`Segmentations fetch failed: ${res.status}`);
+  }
+  const data = (await res.json()) as { segmentations?: SegmentationMetadata[] };
+  return data.segmentations ?? [];
 }

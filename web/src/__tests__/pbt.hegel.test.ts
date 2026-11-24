@@ -9,6 +9,7 @@ import {
   type FrameDescriptor,
 } from '../api/client';
 import { mapSeriesFramesToMetadata } from '../cornerstone/seriesMapping';
+import { compositeSegMasksRgba, extractMultipartFirstPart } from '../cornerstone/segOverlay';
 
 const uidGen = gs.fromRegex('1\\.2\\.[0-9]{1,6}(\\.[0-9]{1,6}){1,5}');
 
@@ -148,6 +149,42 @@ describe('Hegel PBT — frontend helpers & Cornerstone frame mapping', () => {
         const expectedMeta = metaMap.get(frame.sop_instance_uid) ?? metadataList[0];
         expect(mapped[i].metadata).toBe(expectedMeta);
       }
+    });
+  });
+
+  test('compositeSegMasksRgba and extractMultipartFirstPart maintain invariants over arbitrary inputs', () => {
+    hegel.test((tc) => {
+      const rows = tc.draw(gs.integers({ minValue: 1, maxValue: 12 }));
+      const cols = tc.draw(gs.integers({ minValue: 1, maxValue: 12 }));
+      const n = rows * cols;
+      const mask = new Uint8Array(
+        tc.draw(gs.arrays(gs.integers({ minValue: 0, maxValue: 255 }), { minSize: n, maxSize: n })),
+      );
+      const r = tc.draw(gs.integers({ minValue: 0, maxValue: 255 }));
+      const g = tc.draw(gs.integers({ minValue: 0, maxValue: 255 }));
+      const b = tc.draw(gs.integers({ minValue: 0, maxValue: 255 }));
+      const a = tc.draw(gs.integers({ minValue: 0, maxValue: 255 }));
+
+      const out = compositeSegMasksRgba(rows, cols, [{ mask, colorRgba: [r, g, b, a] }]);
+      expect(out).toHaveLength(n * 4);
+      for (let i = 0; i < n; i++) {
+        if (mask[i] === 0 || a === 0) {
+          expect(out[i * 4 + 3]).toBe(0);
+        } else {
+          expect(out[i * 4]).toBe(r);
+          expect(out[i * 4 + 1]).toBe(g);
+          expect(out[i * 4 + 2]).toBe(b);
+        }
+      }
+
+      const bnd = tc.draw(gs.fromRegex('bnd-[a-z0-9]{3,10}'));
+      const prefix = new TextEncoder().encode(`--${bnd}\r\nContent-Type: application/octet-stream\r\n\r\n`);
+      const suffix = new TextEncoder().encode(`\r\n--${bnd}--\r\n`);
+      const joined = new Uint8Array(prefix.length + mask.length + suffix.length);
+      joined.set(prefix, 0);
+      joined.set(mask, prefix.length);
+      joined.set(suffix, prefix.length + mask.length);
+      expect(extractMultipartFirstPart(`multipart/related; boundary="${bnd}"`, joined)).toEqual(mask);
     });
   });
 });

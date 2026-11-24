@@ -14,6 +14,7 @@ cloud-s3 = ["lance/aws"]
 cloud-gcs = ["lance/gcp"]
 cloud-azure = ["lance/azure"]
 cloud = ["cloud-s3", "cloud-gcs"]
+codec-jpegls = ["dicom-pixeldata/charls"]
 
 [dependencies]
 lance = { version = "14.0.3", default-features = false }
@@ -32,9 +33,10 @@ bytes = "1"
 dicom-core = "0.10"
 dicom-dictionary-std = "0.10"
 dicom-encoding = "0.10"
-dicom-object = "0.10"
-dicom-pixeldata = { version = "0.10", default-features = false, features = ["rle", "jpeg", "image"] }
+dicom-object = { version = "0.10", features = ["deflate"] }
+dicom-pixeldata = { version = "0.10", default-features = false, features = ["rle", "jpeg", "openjpeg-sys", "deflate", "jpegxl", "image"] }
 dicom-json = "0.10"
+flate2 = "1"
 png = "0.17"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +51,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 http-body-util = "0.1"
 hegeltest = "0.54.1"
+dicom-transfer-syntax-registry = "0.10"
 
 [profile.dev]
 debug = 0

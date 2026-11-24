@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::dicom_ingest::IngestedSeries;
 use crate::embedding::{rrf_fuse, EmbedError, Embedder, LocalMultimodalEmbedder};
 use crate::schema::{build_frames_batch, build_series_batch, SchemaError};
+use crate::seg::{parse_segmentation_from_dicom_json, SegmentationMetadata, SEGMENTATION_STORAGE_UID};
 
 const SERIES_TABLE: &str = "dicom_series.lance";
 const FRAMES_TABLE: &str = "dicom_frames.lance";
@@ -262,6 +263,10 @@ pub struct FrameDescriptor {
 pub struct FrameBlobPayload {
     pub frame_number: i32,
     pub transfer_syntax_uid: String,
+    pub rows: i32,
+    pub columns: i32,
+    pub samples_per_pixel: i32,
+    pub bits_allocated: i32,
     pub blob_kind: String,
     pub total_blob_size: u64,
     pub bytes: Vec<u8>,
@@ -1164,22 +1169,40 @@ impl DicomLanceStore {
             .join(",");
 
         let mut scanner = dataset.scan();
-        scanner.project(&["frame_number", "transfer_syntax_uid"])?;
+        scanner.project(&[
+            "frame_number",
+            "transfer_syntax_uid",
+            "rows",
+            "columns",
+            "samples_per_pixel",
+            "bits_allocated",
+        ])?;
         scanner.with_row_id();
         scanner.filter(&format!(
             "study_instance_uid = '{safe_study}' AND series_instance_uid = '{safe_series}' AND sop_instance_uid = '{safe_sop}' AND frame_number IN ({in_list})"
         ))?;
 
         let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
-        let mut by_frame: HashMap<i32, (u64, String)> = HashMap::new();
+        let mut by_frame: HashMap<i32, (u64, String, i32, i32, i32, i32)> = HashMap::new();
         for batch in batches {
             let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
             let fnums = batch["frame_number"].as_primitive::<Int32Type>();
             let tses = batch["transfer_syntax_uid"].as_string::<i32>();
+            let rows_col = batch["rows"].as_primitive::<Int32Type>();
+            let cols_col = batch["columns"].as_primitive::<Int32Type>();
+            let spp_col = batch["samples_per_pixel"].as_primitive::<Int32Type>();
+            let bits_col = batch["bits_allocated"].as_primitive::<Int32Type>();
             for i in 0..batch.num_rows() {
                 by_frame.insert(
                     fnums.value(i),
-                    (row_ids.value(i), tses.value(i).to_string()),
+                    (
+                        row_ids.value(i),
+                        tses.value(i).to_string(),
+                        rows_col.value(i),
+                        cols_col.value(i),
+                        spp_col.value(i),
+                        bits_col.value(i),
+                    ),
                 );
             }
         }
@@ -1188,10 +1211,19 @@ impl DicomLanceStore {
         let mut unique_row_ids = Vec::new();
         let mut seen_rids = HashSet::new();
         for &fnum in frame_numbers {
-            let (rid, ts_uid) = by_frame.get(&fnum).ok_or_else(|| {
-                StoreError::NotFound(format!("frame {fnum} not found for {sop_uid}"))
-            })?;
-            requested.push((fnum, *rid, ts_uid.clone()));
+            let (rid, ts_uid, rows_i, cols_i, spp_i, bits_i) =
+                by_frame.get(&fnum).ok_or_else(|| {
+                    StoreError::NotFound(format!("frame {fnum} not found for {sop_uid}"))
+                })?;
+            requested.push((
+                fnum,
+                *rid,
+                ts_uid.clone(),
+                *rows_i,
+                *cols_i,
+                *spp_i,
+                *bits_i,
+            ));
             if seen_rids.insert(*rid) {
                 unique_row_ids.push(*rid);
             }
@@ -1220,13 +1252,17 @@ impl DicomLanceStore {
         }
 
         let mut results = Vec::with_capacity(requested.len());
-        for (frame_number, rid, ts_uid) in requested {
+        for (frame_number, rid, ts_uid, rows_i, cols_i, spp_i, bits_i) in requested {
             let (blob_kind, total_blob_size, bytes) = cached_payloads
                 .get(&rid)
                 .ok_or_else(|| StoreError::NotFound(format!("missing blob cache for row {rid}")))?;
             results.push(FrameBlobPayload {
                 frame_number,
                 transfer_syntax_uid: ts_uid,
+                rows: rows_i,
+                columns: cols_i,
+                samples_per_pixel: spp_i,
+                bits_allocated: bits_i,
                 blob_kind: blob_kind.clone(),
                 total_blob_size: *total_blob_size,
                 bytes: bytes.clone(),
@@ -1234,6 +1270,107 @@ impl DicomLanceStore {
         }
 
         Ok(results)
+    }
+
+    pub async fn get_series_segmentations(
+        &self,
+        study_uid: &str,
+        referenced_series_uid: &str,
+    ) -> Result<Vec<SegmentationMetadata>, StoreError> {
+        let safe_study = validate_sql_literal(study_uid, "study_instance_uid")?;
+        let safe_ref_series = validate_sql_literal(referenced_series_uid, "series_instance_uid")?;
+
+        let Some(series_ds) = self.get_series_dataset().await? else {
+            return Ok(Vec::new());
+        };
+        let Some(frames_ds) = self.get_frames_dataset().await? else {
+            return Ok(Vec::new());
+        };
+
+        let mut s_scan = series_ds.scan();
+        s_scan.project(&["series_instance_uid", "series_description", "rows", "columns"])?;
+        s_scan.filter(&format!(
+            "study_instance_uid = '{safe_study}' AND modality = 'SEG'"
+        ))?;
+        let s_batches: Vec<RecordBatch> = s_scan.try_into_stream().await?.try_collect().await?;
+
+        let mut seg_series = Vec::new();
+        for batch in s_batches {
+            let suids = batch["series_instance_uid"].as_string::<i32>();
+            let descs = batch["series_description"].as_string::<i32>();
+            let rows_col = batch["rows"].as_primitive::<Int32Type>();
+            let cols_col = batch["columns"].as_primitive::<Int32Type>();
+            for i in 0..batch.num_rows() {
+                seg_series.push((
+                    suids.value(i).to_string(),
+                    descs.value(i).to_string(),
+                    rows_col.value(i),
+                    cols_col.value(i),
+                ));
+            }
+        }
+        if seg_series.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        for (seg_series_uid, series_desc, fallback_rows, fallback_cols) in seg_series {
+            let safe_seg_series = validate_sql_literal(&seg_series_uid, "series_instance_uid")?;
+            let mut f_scan = frames_ds.scan();
+            f_scan.project(&["sop_instance_uid", "dicom_json_header", "rows", "columns"])?;
+            f_scan.filter(&format!(
+                "study_instance_uid = '{safe_study}' AND series_instance_uid = '{safe_seg_series}'"
+            ))?;
+            let f_batches: Vec<RecordBatch> = f_scan.try_into_stream().await?.try_collect().await?;
+
+            let mut seen_sops = HashSet::new();
+            for fb in f_batches {
+                let sops = fb["sop_instance_uid"].as_string::<i32>();
+                let jsons = fb["dicom_json_header"].as_string::<i32>();
+                let f_rows = fb["rows"].as_primitive::<Int32Type>();
+                let f_cols = fb["columns"].as_primitive::<Int32Type>();
+                for i in 0..fb.num_rows() {
+                    let sop_uid = sops.value(i).to_string();
+                    if !seen_sops.insert(sop_uid.clone()) {
+                        continue;
+                    }
+                    let json_val: serde_json::Value = serde_json::from_str(jsons.value(i))?;
+                    let rows = if f_rows.value(i) > 0 {
+                        f_rows.value(i)
+                    } else {
+                        fallback_rows
+                    };
+                    let cols = if f_cols.value(i) > 0 {
+                        f_cols.value(i)
+                    } else {
+                        fallback_cols
+                    };
+                    if let Some(parsed) = parse_segmentation_from_dicom_json(
+                        &seg_series_uid,
+                        &sop_uid,
+                        &series_desc,
+                        rows,
+                        cols,
+                        &json_val,
+                    ) {
+                        let matches_series = parsed
+                            .referenced_series_uid
+                            .as_deref()
+                            .is_none_or(|r| r == safe_ref_series);
+                        if matches_series {
+                            out.push(parsed);
+                        }
+                    }
+                }
+            }
+        }
+
+        out.sort_by(|a, b| {
+            a.seg_series_instance_uid
+                .cmp(&b.seg_series_instance_uid)
+                .then_with(|| a.seg_sop_instance_uid.cmp(&b.seg_sop_instance_uid))
+        });
+        Ok(out)
     }
 
     pub async fn find_similar_frames(
@@ -1258,7 +1395,7 @@ impl DicomLanceStore {
         }
 
         let mut q_scan = frames_ds.scan();
-        q_scan.project(&["frame_embedding"])?;
+        q_scan.project(&["frame_embedding", "sop_class_uid"])?;
         q_scan.filter(&format!(
             "study_instance_uid = '{safe_study}' AND series_instance_uid = '{safe_series}' AND sop_instance_uid = '{safe_sop}' AND frame_number = {frame_number}"
         ))?;
@@ -1266,6 +1403,7 @@ impl DicomLanceStore {
 
         let q_batches: Vec<RecordBatch> = q_scan.try_into_stream().await?.try_collect().await?;
         let mut query_vec: Option<Vec<f32>> = None;
+        let mut query_sop_class = String::new();
         for batch in q_batches {
             if batch.num_rows() > 0 {
                 let fsl = batch["frame_embedding"].as_fixed_size_list();
@@ -1277,6 +1415,7 @@ impl DicomLanceStore {
                 let arr = fsl.value(0);
                 let floats = arr.as_primitive::<Float32Type>();
                 query_vec = Some(floats.values().to_vec());
+                query_sop_class = batch["sop_class_uid"].as_string::<i32>().value(0).to_string();
                 break;
             }
         }
@@ -1300,6 +1439,10 @@ impl DicomLanceStore {
             "_distance",
         ])?;
         knn_scan.disable_scoring_autoprojection();
+        if query_sop_class != SEGMENTATION_STORAGE_UID {
+            knn_scan.filter(&format!("sop_class_uid != '{SEGMENTATION_STORAGE_UID}'"))?;
+            knn_scan.prefilter(true);
+        }
         let q_arr = Float32Array::from(query_vec);
         knn_scan.nearest("frame_embedding", &q_arr, k_fetch)?;
         knn_scan.distance_metric(MetricType::Cosine);

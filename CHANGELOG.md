@@ -4,6 +4,16 @@ All notable changes to `dicom-lance` are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Clinical DICOM Format Depth**:
+  - Enabled `cmake`-free compressed codecs in `Cargo.toml`: **JPEG 2000 / HTJ2K** (`openjpeg-sys`, `BSD-2-Clause` compiled via `cc`), **Deflated Explicit VR Little Endian** & **Deflated Image Frame Compression** (`deflate` / `flate2`), **JPEG XL** (`jpegxl` / `jxl-oxide`), **RLE Lossless**, and **JPEG** (with optional C++ JPEG-LS gated behind `--features codec-jpegls`).
+  - **WADO-RS `Accept` Transfer-Syntax Negotiation (`src/codecs.rs`, `src/api.rs`)**: Quality-weighted PS3.18 media-type negotiation supporting `1.2.840.10008.1.2.1`, `1.2.840.10008.1.2`, `1.2.840.10008.1.2.5` (pure-Rust DICOM Annex G PackBits RLE encoder), and `1.2.840.10008.1.2.8.1`, with structured `406 Not Acceptable` responses on unsupported syntaxes or compressed byte ranges.
+  - **Enhanced Multi-Frame CT/MR (`src/dicom_ingest.rs`, `web/src/cornerstone/seriesMapping.ts`)**: Shared (`5200,9229`) and Per-Frame (`5200,9230`) Functional Groups extraction for per-frame 3D normal sorting, VOI LUT, rescale, and Cornerstone3D per-frame metadata projection.
+  - **DICOM SEG Storage & Viewer Overlay (`src/seg.rs`, `src/store.rs`, `src/phantom.rs`, `web/src/cornerstone/`)**: 1-bit packed segmentation unpacking, PS3.3 `RecommendedDisplayCIELabValue` -> sRGB conversion, `GET /api/studies/{study}/series/{series}/segmentations`, CT/MR `find_similar_frames` SEG exclusion filter, seeded 16-frame Chest CT RUL Spiculated Nodule DICOM SEG phantom (`4` series / `128` frames total), and Cornerstone3D Stack **"SEG Overlay"** toggle with affine camera-locked mask rendering and lesion legend.
+  - Expanded Rust Hegel PBT, multi-codec & Enhanced/SEG integration tests, frontend Vitest/Hegel PBT, and hermetic WCAG 2.2 AA & live WebGL2 Playwright E2E coverage.
+
 ## [0.2.0] - 2026-11-23
 
 ### Added
