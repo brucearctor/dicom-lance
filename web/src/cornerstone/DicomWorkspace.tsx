@@ -138,6 +138,8 @@ export function DicomWorkspace({
       }
     }
     setPresetId('auto');
+    setFrames([]);
+    setSliceIndex(0);
     setShowSimilar(false);
     setSimilarHits([]);
     setSimilarError(null);

@@ -70,12 +70,15 @@ test.describe('Live Rust + Lance v2.2 + Cornerstone3D WebGL2 E2E', () => {
     const stackStats = await sampleCanvasStats(page);
     expect(stackStats[0].buckets).toBeGreaterThanOrEqual(4);
 
-    // 2a. Select Chest CT, scrub to Slice 23 (index 22, z = -25.0 mm), and verify DICOM SEG Overlay
+    // 2a. Select Chest CT, wait for its 64-frame stack to finish mounting, scrub to Slice 23 (index 22, z = -25.0 mm), and verify DICOM SEG Overlay
     await page
       .getByRole('button', { name: /\[CT\] Axial Lung 2\.5mm RUL Spiculated Nodule/i })
       .click();
-    await expect(page.getByText(/^CT · 192×192/)).toBeVisible();
+    await expect(page.getByText('2D Stack ready (64 frames from Lance Blob V2)')).toBeVisible({
+      timeout: 25_000,
+    });
     const sliceSlider = page.locator('#slice-slider');
+    await expect(sliceSlider).toHaveAttribute('max', '63');
     await sliceSlider.fill('22');
     await expect(page.getByText(/z = -25\.0 mm/)).toBeVisible();
 
