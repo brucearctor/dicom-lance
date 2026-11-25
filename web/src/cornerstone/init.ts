@@ -18,7 +18,7 @@ import {
   WindowLevelTool,
   ZoomTool,
 } from '@cornerstonejs/tools';
-import { type FrameDescriptor } from '../api/client';
+import { type FrameDescriptor, getAuthHeaders } from '../api/client';
 import { mapSeriesFramesToMetadata } from './seriesMapping';
 
 export type ToolMode =
@@ -37,7 +37,10 @@ export function initCornerstoneOnce(): Promise<void> {
     initPromise = (async () => {
       await Promise.resolve(coreInit());
       toolsInit();
-      dicomImageLoaderInit({ maxWebWorkers: 2 });
+      dicomImageLoaderInit({
+        maxWebWorkers: 2,
+        beforeSend: () => getAuthHeaders(),
+      });
 
       // Strictly in-memory cache (no localStorage/sessionStorage persistence)
       cache.setMaxCacheSize(512 * 1024 * 1024);

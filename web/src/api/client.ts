@@ -111,6 +111,9 @@ export interface StoreStats {
   embedder?: string;
   cache_hits_series?: number;
   cache_hits_frames?: number;
+  deidentify_enabled?: boolean;
+  auth_enabled?: boolean;
+  allow_directory_ingest?: boolean;
   blob_v2_kind_sample: string | null;
   blob_v2_inline_threshold_bytes: number;
   series_dataset: DatasetStats;
@@ -121,6 +124,69 @@ export interface IngestReport {
   series_ingested: number;
   frames_ingested: number;
   study_uids: string[];
+}
+
+export interface DeleteStudyReport {
+  study_instance_uid: string;
+  series_deleted: number;
+  frames_deleted: number;
+}
+
+export interface DatasetMaintenanceStats {
+  exists: boolean;
+  version: number;
+  row_count: number;
+  fragment_count: number;
+  fragments_removed: number;
+  fragments_added: number;
+  files_removed: number;
+  files_added: number;
+  old_versions_removed: number;
+  bytes_removed: number;
+  data_files_removed: number;
+  deletion_files_removed: number;
+  index_files_removed: number;
+}
+
+export interface MaintenanceReport {
+  series: DatasetMaintenanceStats;
+  frames: DatasetMaintenanceStats;
+}
+
+export class ApiUnauthorizedError extends Error {
+  constructor(message = 'Authentication required (missing or invalid bearer token)') {
+    super(message);
+    this.name = 'ApiUnauthorizedError';
+  }
+}
+
+// Strictly in-memory bearer token (Zero Browser Storage: never persisted to localStorage/sessionStorage)
+let inMemoryAuthToken: string | null = null;
+
+export function setAuthToken(token: string | null): void {
+  const trimmed = token?.trim() ?? '';
+  inMemoryAuthToken = trimmed.length > 0 ? trimmed : null;
+}
+
+export function getAuthToken(): string | null {
+  return inMemoryAuthToken;
+}
+
+export function getAuthHeaders(): Record<string, string> {
+  return inMemoryAuthToken ? { Authorization: `Bearer ${inMemoryAuthToken}` } : {};
+}
+
+export async function apiFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  const auth = getAuthHeaders();
+  for (const [k, v] of Object.entries(auth)) {
+    headers.set(k, v);
+  }
+  const res = await fetch(input, { ...init, headers });
+  if (res.status === 401) {
+    throw new ApiUnauthorizedError();
+  }
+  return res;
 }
 
 export interface WindowPreset {
@@ -179,7 +245,7 @@ export function buildWadoImageId(
 }
 
 export async function fetchStats(): Promise<StoreStats> {
-  const res = await fetch('/api/stats');
+  const res = await apiFetch('/api/stats');
   if (!res.ok) {
     throw new Error(`Stats failed: ${res.status}`);
   }
@@ -191,7 +257,7 @@ export async function searchStudies(
   modality: string,
   mode: SearchMode = 'hybrid',
 ): Promise<StudySummary[]> {
-  const res = await fetch(buildSearchUrl(query, modality, mode));
+  const res = await apiFetch(buildSearchUrl(query, modality, mode));
   if (!res.ok) {
     throw new Error(`Search failed: ${res.status}`);
   }
@@ -200,19 +266,23 @@ export async function searchStudies(
 }
 
 export async function seedPhantoms(): Promise<IngestReport> {
-  const res = await fetch('/api/ingest/seed-phantoms', { method: 'POST' });
+  const res = await apiFetch('/api/ingest/seed-phantoms', { method: 'POST' });
   if (!res.ok) {
     throw new Error(`Seed phantoms failed: ${res.status}`);
   }
   return (await res.json()) as IngestReport;
 }
 
-export async function uploadDicomFiles(files: FileList | File[]): Promise<IngestReport> {
+export async function uploadDicomFiles(
+  files: FileList | File[],
+  deidentify = false,
+): Promise<IngestReport> {
   const form = new FormData();
   for (const file of Array.from(files)) {
     form.append('files', file, file.name);
   }
-  const res = await fetch('/api/ingest/upload', {
+  const url = deidentify ? '/api/ingest/upload?deidentify=true' : '/api/ingest/upload';
+  const res = await apiFetch(url, {
     method: 'POST',
     body: form,
   });
@@ -223,11 +293,14 @@ export async function uploadDicomFiles(files: FileList | File[]): Promise<Ingest
   return (await res.json()) as IngestReport;
 }
 
-export async function ingestDirectory(path: string): Promise<IngestReport> {
-  const res = await fetch('/api/ingest/directory', {
+export async function ingestDirectory(
+  path: string,
+  deidentify = false,
+): Promise<IngestReport> {
+  const res = await apiFetch('/api/ingest/directory', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path }),
+    body: JSON.stringify(deidentify ? { path, deidentify: true } : { path }),
   });
   if (!res.ok) {
     const body = await res.text();
@@ -236,11 +309,39 @@ export async function ingestDirectory(path: string): Promise<IngestReport> {
   return (await res.json()) as IngestReport;
 }
 
+export async function deleteStudy(studyUid: string): Promise<DeleteStudyReport> {
+  const res = await apiFetch(`/api/studies/${encodeURIComponent(studyUid)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Delete study failed (${res.status}): ${body}`);
+  }
+  return (await res.json()) as DeleteStudyReport;
+}
+
+export async function compactDatasets(opts?: {
+  retain_versions?: number;
+  delete_unverified?: boolean;
+  materialize_deletions_threshold?: number;
+}): Promise<MaintenanceReport> {
+  const res = await apiFetch('/api/maintenance/compact', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(opts ?? {}),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Compaction failed (${res.status}): ${body}`);
+  }
+  return (await res.json()) as MaintenanceReport;
+}
+
 export async function fetchSeriesMetadata(
   studyUid: string,
   seriesUid: string,
 ): Promise<Record<string, unknown>[]> {
-  const res = await fetch(`/dicomweb/studies/${studyUid}/series/${seriesUid}/metadata`);
+  const res = await apiFetch(`/dicomweb/studies/${studyUid}/series/${seriesUid}/metadata`);
   if (!res.ok) {
     throw new Error(`WADO-RS metadata failed: ${res.status}`);
   }
@@ -251,7 +352,7 @@ export async function fetchFramesManifest(
   studyUid: string,
   seriesUid: string,
 ): Promise<FrameDescriptor[]> {
-  const res = await fetch(`/api/studies/${studyUid}/series/${seriesUid}/frames-manifest`);
+  const res = await apiFetch(`/api/studies/${studyUid}/series/${seriesUid}/frames-manifest`);
   if (!res.ok) {
     throw new Error(`Frames manifest failed: ${res.status}`);
   }
@@ -266,7 +367,7 @@ export async function fetchSimilarFrames(
   frameNumber: number,
   limit = 6,
 ): Promise<SimilarFrameHit[]> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/studies/${studyUid}/series/${seriesUid}/instances/${sopUid}/frames/${frameNumber}/similar?limit=${limit}`,
   );
   if (!res.ok) {
@@ -280,7 +381,7 @@ export async function fetchSeriesSegmentations(
   studyUid: string,
   seriesUid: string,
 ): Promise<SegmentationMetadata[]> {
-  const res = await fetch(`/api/studies/${studyUid}/series/${seriesUid}/segmentations`);
+  const res = await apiFetch(`/api/studies/${studyUid}/series/${seriesUid}/segmentations`);
   if (res.status === 404) {
     return [];
   }

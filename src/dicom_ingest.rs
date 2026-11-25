@@ -8,6 +8,7 @@ use dicom_dictionary_std::tags;
 use dicom_object::{from_reader, DefaultDicomObject, InMemDicomObject};
 use dicom_pixeldata::{PixelDecoder, PixelRepresentation};
 
+use crate::deid::DeidConfig;
 use crate::schema::{FrameRecord, SeriesRecord};
 use crate::seg::{extract_seg_summary_text, unpack_bitpacked_frames, SEGMENTATION_STORAGE_UID};
 
@@ -586,8 +587,11 @@ fn decode_instance_frames(
     })
 }
 
-fn parse_single_dicom(bytes: &[u8]) -> Result<ParsedInstance, IngestError> {
-    let file_obj = from_reader(Cursor::new(bytes))?;
+fn parse_single_dicom(bytes: &[u8], deid: Option<&DeidConfig>) -> Result<ParsedInstance, IngestError> {
+    let mut file_obj = from_reader(Cursor::new(bytes))?;
+    if let Some(cfg) = deid.filter(|c| c.enabled) {
+        cfg.deidentify_file_object(&mut file_obj);
+    }
     let ds = &*file_obj;
 
     let study_uid = opt_str(ds, tags::STUDY_INSTANCE_UID)
@@ -762,13 +766,20 @@ fn parse_single_dicom(bytes: &[u8]) -> Result<ParsedInstance, IngestError> {
 }
 
 pub fn parse_dicom_instances(raw_files: &[Bytes]) -> Result<Vec<IngestedSeries>, IngestError> {
+    parse_dicom_instances_with_deid(raw_files, None)
+}
+
+pub fn parse_dicom_instances_with_deid(
+    raw_files: &[Bytes],
+    deid: Option<&DeidConfig>,
+) -> Result<Vec<IngestedSeries>, IngestError> {
     if raw_files.is_empty() {
         return Err(IngestError::Invalid("no DICOM files provided".to_string()));
     }
 
     let mut grouped: BTreeMap<(String, String), Vec<ParsedInstance>> = BTreeMap::new();
     for bytes in raw_files {
-        let parsed = parse_single_dicom(bytes)?;
+        let parsed = parse_single_dicom(bytes, deid)?;
         grouped
             .entry((parsed.study_uid.clone(), parsed.series_uid.clone()))
             .or_default()

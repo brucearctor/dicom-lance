@@ -7,13 +7,14 @@ use dicom_core::value::{DataSetSequence, PixelFragmentSequence};
 use dicom_core::{DataElement, Length, PrimitiveValue, Tag, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_lance::api::{
-    encode_multipart_related, extract_boundary, parse_frame_numbers, parse_range_header,
-    split_multipart_related,
+    constant_time_token_eq, encode_multipart_related, extract_boundary, parse_cors_origins,
+    parse_frame_numbers, parse_range_header, split_multipart_related,
 };
 use dicom_lance::codecs::{
     encode_rle_lossless_frame, negotiate_wado_accept, NegotiatedTransferSyntax, TS_DEFLATED_IMAGE_FRAME,
     TS_EXPLICIT_VR_LE, TS_IMPLICIT_VR_LE, TS_RLE_LOSSLESS,
 };
+use dicom_lance::deid::DeidConfig;
 use dicom_lance::dicom_ingest::{
     extract_sr_text, parse_dicom_instances, render_thumbnail_png, slice_normal_projection,
 };
@@ -1181,4 +1182,190 @@ fn pbt_seg_bitpack_and_cielab_round_trip(tc: TestCase) {
     assert!((i16::from(r) - i16::from(r2)).abs() <= 3);
     assert!((i16::from(g) - i16::from(g2)).abs() <= 3);
     assert!((i16::from(b) - i16::from(b2)).abs() <= 3);
+}
+
+#[hegel::test]
+fn pbt_deid_uid_determinism_validity_and_salt_isolation(tc: TestCase) {
+    let uid1 = tc.draw(gs::from_regex(r"1\.2\.[1-9][0-9]{0,7}(\.[1-9][0-9]{0,7}){2,4}"));
+    let uid2 = tc.draw(gs::from_regex(r"1\.2\.[1-9][0-9]{0,7}(\.[1-9][0-9]{0,7}){2,4}"));
+    tc.assume(uid1 != uid2);
+
+    let salt1 = tc.draw(gs::from_regex(r"[A-Za-z0-9_-]{4,24}"));
+    let salt2 = tc.draw(gs::from_regex(r"[A-Za-z0-9_-]{4,24}"));
+    tc.assume(salt1 != salt2);
+
+    let cfg1 = DeidConfig::enabled_with_salt(&salt1);
+    let cfg2 = DeidConfig::enabled_with_salt(&salt2);
+
+    let m1 = cfg1.remap_uid(&uid1);
+    let m1_repeat = cfg1.remap_uid(&uid1);
+    let m2 = cfg1.remap_uid(&uid2);
+    let m1_other_salt = cfg2.remap_uid(&uid1);
+
+    assert_eq!(m1, m1_repeat);
+    assert_ne!(m1, uid1);
+    assert_ne!(m1, m2);
+    assert_ne!(m1, m1_other_salt);
+    assert!(m1.starts_with("2.25."));
+    assert!(m1.len() <= 64);
+    assert!(m1.bytes().all(|b| b.is_ascii_digit() || b == b'.'));
+    assert!(m1
+        .split('.')
+        .all(|part| !part.is_empty() && (part == "0" || !part.starts_with('0'))));
+
+    let year = tc.draw(gs::integers::<u16>().min_value(1950).max_value(2035));
+    let month = tc.draw(gs::integers::<u8>().min_value(1).max_value(12));
+    let day = tc.draw(gs::integers::<u8>().min_value(1).max_value(28));
+    let raw_date = format!("{year:04}{month:02}{day:02}");
+    assert_eq!(cfg1.generalize_date(&raw_date), format!("{year:04}0101"));
+
+    let mut no_year = cfg1.clone();
+    no_year.keep_study_date_year = false;
+    assert_eq!(no_year.generalize_date(&raw_date), "");
+
+    assert_eq!(cfg1.pseudonymize_accession("   "), "");
+    assert!(cfg1.pseudonymize_accession("ACC-999").starts_with("ACC-"));
+}
+
+#[hegel::test]
+fn pbt_deid_preserves_ct_seg_cross_references_and_strips_phi(tc: TestCase) {
+    let patient_id = tc.draw(gs::from_regex(r"PID-[A-Z0-9]{4,10}"));
+    let patient_name = tc.draw(gs::from_regex(r"[A-Z][a-z]{2,8}\^[A-Z][a-z]{2,8}"));
+    let institution = tc.draw(gs::from_regex(r"Clinic [A-Z]{2,6}"));
+    let physician = tc.draw(gs::from_regex(r"Dr [A-Z][a-z]{3,10}"));
+    let salt = tc.draw(gs::from_regex(r"[A-Za-z0-9]{6,16}"));
+
+    let study_uid = tc.draw(gs::from_regex(r"1\.2\.826\.[1-9][0-9]{2,6}\.[1-9][0-9]{1,4}"));
+    let ct_series_uid = format!("{study_uid}.1");
+    let ct_sop_uid = format!("{ct_series_uid}.1");
+    let seg_series_uid = format!("{study_uid}.3");
+    let seg_sop_uid = format!("{seg_series_uid}.1");
+
+    let mut ct = InMemDicomObject::new_empty();
+    put_str(&mut ct, tags::PATIENT_ID, VR::LO, &patient_id);
+    put_str(&mut ct, tags::PATIENT_NAME, VR::PN, &patient_name);
+    put_str(&mut ct, tags::INSTITUTION_NAME, VR::LO, &institution);
+    put_str(&mut ct, tags::REFERRING_PHYSICIAN_NAME, VR::PN, &physician);
+    put_str(&mut ct, tags::PATIENT_BIRTH_DATE, VR::DA, "19740519");
+    put_str(&mut ct, tags::STUDY_INSTANCE_UID, VR::UI, &study_uid);
+    put_str(&mut ct, tags::SERIES_INSTANCE_UID, VR::UI, &ct_series_uid);
+    put_str(&mut ct, tags::SOP_CLASS_UID, VR::UI, uids::CT_IMAGE_STORAGE);
+    put_str(&mut ct, tags::SOP_INSTANCE_UID, VR::UI, &ct_sop_uid);
+    ct.put_element(DataElement::new(
+        Tag(0x0019, 0x1001),
+        VR::LO,
+        PrimitiveValue::from("PRIVATE-PHI-TOKEN"),
+    ));
+    let mut ct_file = ct
+        .with_meta(
+            FileMetaTableBuilder::new()
+                .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+                .media_storage_sop_class_uid(uids::CT_IMAGE_STORAGE)
+                .media_storage_sop_instance_uid(&ct_sop_uid),
+        )
+        .unwrap();
+
+    let mut seg = InMemDicomObject::new_empty();
+    put_str(&mut seg, tags::PATIENT_ID, VR::LO, &patient_id);
+    put_str(&mut seg, tags::PATIENT_NAME, VR::PN, &patient_name);
+    put_str(&mut seg, tags::STUDY_INSTANCE_UID, VR::UI, &study_uid);
+    put_str(&mut seg, tags::SERIES_INSTANCE_UID, VR::UI, &seg_series_uid);
+    put_str(&mut seg, tags::SOP_CLASS_UID, VR::UI, uids::SEGMENTATION_STORAGE);
+    put_str(&mut seg, tags::SOP_INSTANCE_UID, VR::UI, &seg_sop_uid);
+    seg.put_element(DataElement::new(
+        Tag(0x0029, 0x0010),
+        VR::LO,
+        PrimitiveValue::from("PRIVATE-VENDOR-ID"),
+    ));
+    let mut ref_inst = InMemDicomObject::new_empty();
+    put_str(&mut ref_inst, tags::REFERENCED_SOP_CLASS_UID, VR::UI, uids::CT_IMAGE_STORAGE);
+    put_str(&mut ref_inst, tags::REFERENCED_SOP_INSTANCE_UID, VR::UI, &ct_sop_uid);
+    let mut ref_series = InMemDicomObject::new_empty();
+    put_str(&mut ref_series, tags::SERIES_INSTANCE_UID, VR::UI, &ct_series_uid);
+    ref_series.put_element(DataElement::new(
+        tags::REFERENCED_INSTANCE_SEQUENCE,
+        VR::SQ,
+        DataSetSequence::new(vec![ref_inst], Length::UNDEFINED),
+    ));
+    seg.put_element(DataElement::new(
+        tags::REFERENCED_SERIES_SEQUENCE,
+        VR::SQ,
+        DataSetSequence::new(vec![ref_series], Length::UNDEFINED),
+    ));
+    let mut seg_file = seg
+        .with_meta(
+            FileMetaTableBuilder::new()
+                .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+                .media_storage_sop_class_uid(uids::SEGMENTATION_STORAGE)
+                .media_storage_sop_instance_uid(&seg_sop_uid),
+        )
+        .unwrap();
+
+    let cfg = DeidConfig::enabled_with_salt(&salt);
+    cfg.deidentify_file_object(&mut ct_file);
+    cfg.deidentify_file_object(&mut seg_file);
+
+    let new_ct_pid = ct_file.element(tags::PATIENT_ID).unwrap().to_str().unwrap();
+    let new_seg_pid = seg_file.element(tags::PATIENT_ID).unwrap().to_str().unwrap();
+    assert_eq!(new_ct_pid, new_seg_pid);
+    assert_ne!(new_ct_pid.as_ref(), patient_id.as_str());
+    assert!(ct_file.element_opt(tags::INSTITUTION_NAME).unwrap().is_none());
+    assert!(ct_file.element_opt(tags::REFERRING_PHYSICIAN_NAME).unwrap().is_none());
+    assert!(ct_file.element_opt(tags::PATIENT_BIRTH_DATE).unwrap().is_none());
+    assert!(ct_file.element_opt(Tag(0x0019, 0x1001)).unwrap().is_none());
+    assert!(seg_file.element_opt(Tag(0x0029, 0x0010)).unwrap().is_none());
+    assert_eq!(
+        ct_file.element(tags::PATIENT_IDENTITY_REMOVED).unwrap().to_str().unwrap().as_ref(),
+        "YES"
+    );
+    assert_eq!(
+        ct_file.element(tags::SOP_CLASS_UID).unwrap().to_str().unwrap().trim_end_matches('\0'),
+        uids::CT_IMAGE_STORAGE
+    );
+
+    // Cross-references remain aligned between CT and SEG
+    let ct_new_study = ct_file.element(tags::STUDY_INSTANCE_UID).unwrap().to_str().unwrap();
+    let seg_new_study = seg_file.element(tags::STUDY_INSTANCE_UID).unwrap().to_str().unwrap();
+    assert_eq!(ct_new_study, seg_new_study);
+    assert_ne!(ct_new_study.as_ref(), study_uid.as_str());
+
+    let ct_new_series = ct_file.element(tags::SERIES_INSTANCE_UID).unwrap().to_str().unwrap();
+    let ct_new_sop = ct_file.element(tags::SOP_INSTANCE_UID).unwrap().to_str().unwrap();
+    assert_eq!(
+        seg_file.meta().media_storage_sop_instance_uid,
+        seg_file.element(tags::SOP_INSTANCE_UID).unwrap().to_str().unwrap().as_ref()
+    );
+
+    let rs_items = seg_file.element(tags::REFERENCED_SERIES_SEQUENCE).unwrap().items().unwrap();
+    let seg_ref_series = rs_items[0].element(tags::SERIES_INSTANCE_UID).unwrap().to_str().unwrap();
+    assert_eq!(seg_ref_series, ct_new_series);
+    let ri_items = rs_items[0].element(tags::REFERENCED_INSTANCE_SEQUENCE).unwrap().items().unwrap();
+    let seg_ref_sop = ri_items[0].element(tags::REFERENCED_SOP_INSTANCE_UID).unwrap().to_str().unwrap();
+    assert_eq!(seg_ref_sop, ct_new_sop);
+}
+
+#[hegel::test]
+fn pbt_constant_time_token_eq_and_cors_origin_validation(tc: TestCase) {
+    let tok1 = tc.draw(gs::text().min_size(1).max_size(64));
+    let tok2 = tc.draw(gs::text().min_size(1).max_size(64));
+
+    assert!(constant_time_token_eq(&tok1, &tok1));
+    assert_eq!(constant_time_token_eq(&tok1, &tok2), tok1 == tok2);
+
+    let port = tc.draw(gs::integers::<u16>().min_value(1).max_value(65535));
+    let scheme = tc.draw(gs::sampled_from(&["http", "https"]));
+    let host = tc.draw(gs::from_regex(r"[a-z]{3,10}\.example\.org"));
+    let valid_origin = format!("{scheme}://{host}:{port}");
+    assert_eq!(parse_cors_origins(&[valid_origin]).unwrap().len(), 1);
+
+    let bad_origin = tc.draw(gs::sampled_from(&[
+        "",
+        "*",
+        "ftp://viewer.example.org",
+        "https://viewer.example.org/app",
+        "https://user@viewer.example.org",
+        "http://:8080",
+        "https://bad host.org",
+    ]));
+    assert!(parse_cors_origins(&[bad_origin.to_string()]).is_err());
 }

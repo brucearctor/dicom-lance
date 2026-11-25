@@ -4,6 +4,23 @@ All notable changes to `dicom-lance` are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **DICOM PS3.15 De-identification (`src/deid.rs`, `src/dicom_ingest.rs`)**:
+  - Added deterministic salted SHA-256 DICOM PS3.15 Basic Profile de-identification across file meta and nested sequences (`CT`/`SR`/`SEG` cross-references stay aligned via consistent Study/Series/SOP/FrameOfReference UID remapping while private tags, direct PHI, observer sequences, and sub-study timestamps are stripped or generalized).
+  - Configurable globally via `--deidentify` / `DEIDENTIFY=true` and `--deidentify-salt` / `DEIDENTIFY_SALT`, or per ingest request via `?deidentify=true` on `/api/ingest/upload`, `/dicomweb/studies` (STOW-RS), and `/api/ingest/seed-phantoms` (`deidentify: true` on `/api/ingest/directory`).
+- **Bearer Authentication, CORS Allowlist & Directory Ingest Guard (`src/api.rs`, `src/main.rs`)**:
+  - Added fixed-time SHA-256 `Authorization: Bearer` middleware (`--api-token` / `API_TOKEN`) protecting all `/api/*` and `/dicomweb/*` endpoints while keeping `/healthz` and the static SPA shell accessible.
+  - Added validated HTTP/HTTPS `--cors-origin` / `CORS_ORIGINS` allowlist support (`AllowOrigin::list`) and automatic disabling (`403 Forbidden`) of `/api/ingest/directory` when binding a non-loopback `--host`.
+- **Study Deletion & Lance Compaction Lifecycle (`src/store.rs`, `src/api.rs`)**:
+  - Added `DELETE /api/studies/{study}` across both `dicom_series.lance` and `dicom_frames.lance` with zero-row index safety and atomic cache updates.
+  - Added `POST /api/maintenance/compact` backed by `lance::dataset::optimize::compact_files` + `CleanupPolicyBuilder` to materialize deletions, re-align scalar/FTS/vector indexes, and reclaim old versions and unreferenced `Blob V2` data files.
+- **Viewer Hardening Controls (`web/src/`)**:
+  - Added RAM-only Bearer Token unlock/lock session workflow (`ApiUnauthorizedError` + Cornerstone `beforeSend`), Upload modal `De-identify PHI` toggle, server directory-ingest policy enforcement, and WCAG 2.2 AA two-step `Delete` -> `Confirm` study removal in the sidebar.
+- **Tests**:
+  - Added Rust Hegel PBT properties and integration tests for PS3.15 de-identification (including SEG overlay cross-reference preservation), Bearer auth/CORS/directory-guard enforcement, and `DELETE` + `compact_files`/cleanup lifecycle, plus Vitest and hermetic Playwright E2E coverage.
+
 ## [0.3.0] - 2026-11-24
 
 ### Added

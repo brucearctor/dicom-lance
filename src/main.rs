@@ -2,9 +2,20 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use dicom_lance::api::{parse_cors_origins, ServerConfig};
+use dicom_lance::deid::DeidConfig;
 use dicom_lance::embedding::HttpEmbedder;
 use dicom_lance::store::DicomLanceStore;
 use tracing_subscriber::EnvFilter;
+
+fn parse_bool_env(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,9 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut static_dir = std::env::var("STATIC_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./web/dist"));
-    let mut seed_on_start = std::env::var("SEED_ON_START")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    let mut seed_on_start = parse_bool_env("SEED_ON_START").unwrap_or(false);
     let mut embedder_url = std::env::var("EMBEDDER_URL")
         .ok()
         .filter(|v| !v.trim().is_empty());
@@ -47,6 +56,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "text-embedding-3-small".to_string());
+
+    let mut api_token = std::env::var("API_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut cors_origins: Vec<String> = std::env::var("CORS_ORIGINS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut deid_enabled = parse_bool_env("DEIDENTIFY").unwrap_or(false);
+    let mut deid_salt = std::env::var("DEIDENTIFY_SALT")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let mut allow_dir_ingest_override = parse_bool_env("ALLOW_DIRECTORY_INGEST");
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -89,9 +117,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     embedder_model = v;
                 }
             }
+            "--api-token" => {
+                if let Some(v) = args.next() {
+                    let trimmed = v.trim().to_string();
+                    api_token = (!trimmed.is_empty()).then_some(trimmed);
+                }
+            }
+            "--cors-origin" => {
+                if let Some(v) = args.next() {
+                    let trimmed = v.trim().to_string();
+                    if !trimmed.is_empty() {
+                        cors_origins.push(trimmed);
+                    }
+                }
+            }
+            "--deidentify" => {
+                deid_enabled = true;
+            }
+            "--deidentify-salt" => {
+                if let Some(v) = args.next() {
+                    if !v.trim().is_empty() {
+                        deid_salt = Some(v);
+                    }
+                }
+            }
+            "--allow-directory-ingest" => {
+                allow_dir_ingest_override = Some(true);
+            }
+            "--disable-directory-ingest" => {
+                allow_dir_ingest_override = Some(false);
+            }
             _ => {}
         }
     }
+
+    parse_cors_origins(&cors_origins)?;
+    let allow_directory_ingest = allow_dir_ingest_override.unwrap_or_else(|| host.is_loopback());
+
+    let default_deid = DeidConfig::default();
+    let deid = DeidConfig {
+        enabled: deid_enabled,
+        salt: deid_salt.unwrap_or(default_deid.salt),
+        ..default_deid
+    };
 
     if !static_dir.exists() {
         let crate_dist = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web/dist");
@@ -110,6 +178,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )));
     }
 
+    let server_config = ServerConfig {
+        api_token,
+        cors_origins,
+        allow_directory_ingest,
+        deid,
+    };
+    tracing::info!(
+        auth_enabled = server_config.api_token.is_some(),
+        cors_allowlist_count = server_config.cors_origins.len(),
+        allow_directory_ingest = server_config.allow_directory_ingest,
+        deidentify_enabled = server_config.deid.enabled,
+        "security configuration initialized"
+    );
+
     let addr = SocketAddr::new(host, port);
-    dicom_lance::api::serve_with_store(addr, Arc::new(store), Some(static_dir), seed_on_start).await
+    dicom_lance::api::serve_with_config(
+        addr,
+        Arc::new(store),
+        Some(static_dir),
+        seed_on_start,
+        server_config,
+    )
+    .await
 }

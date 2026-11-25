@@ -315,6 +315,47 @@ test.describe('DICOM on Lance Workstation (Hermetic Tier-2 E2E)', () => {
         }),
       }),
     );
+
+    let deleted = false;
+    await page.route(`**/api/studies/${STUDY_UID}`, (route) => {
+      if (route.request().method() === 'DELETE') {
+        deleted = true;
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            study_instance_uid: STUDY_UID,
+            series_deleted: 2,
+            frames_deleted: 1,
+          }),
+        });
+      }
+      return route.continue();
+    });
+
+    await page.unroute('**/api/search**');
+    await page.route('**/api/search**', (route) => {
+      if (deleted) {
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ studies: [] }),
+        });
+      }
+      const url = new URL(route.request().url());
+      const mod = url.searchParams.get('modality');
+      const filtered = mod
+        ? MOCK_STUDIES.map((st) => ({
+            ...st,
+            series: st.series.filter((s) => s.modality === mod),
+          })).filter((st) => st.series.length > 0)
+        : MOCK_STUDIES;
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ studies: filtered }),
+      });
+    });
   });
 
   test('renders telemetry, search, SR view, upload modal, Zero Browser Storage, and WCAG 2.2 AA', async ({
@@ -369,12 +410,34 @@ test.describe('DICOM on Lance Workstation (Hermetic Tier-2 E2E)', () => {
     await page.getByRole('button', { name: 'ALL', exact: true }).click();
     await page.getByRole('button', { name: 'Clear Search' }).click();
 
-    // Native <dialog> open and Esc / Cancel close
+    // Native <dialog> open, De-identify PHI checkbox check, and Esc / Cancel close
     await page.getByRole('button', { name: 'Upload DICOM' }).click();
     const dialog = page.getByRole('dialog', { name: /Ingest DICOM Files/i });
     await expect(dialog).toBeVisible();
+    const deidCheckbox = dialog.getByRole('checkbox', {
+      name: /De-identify PHI \(DICOM PS3\.15 Basic Profile\)/i,
+    });
+    await expect(deidCheckbox).toBeVisible();
+    await deidCheckbox.check();
+    await expect(deidCheckbox).toBeChecked();
     await dialog.getByRole('button', { name: 'Cancel' }).click();
     await expect(dialog).toBeHidden();
+
+    // Two-step study deletion flow + WCAG 2.2 AA check during Delete Confirm state
+    await page.getByRole('button', { name: /Delete study Rivera\^Elena/i }).click();
+    const confirmDeleteBtn = page.getByRole('button', { name: /Confirm delete Rivera\^Elena/i });
+    await expect(confirmDeleteBtn).toBeVisible();
+
+    const confirmA11y = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
+      .options({ rules: { 'target-size': { enabled: true } } })
+      .analyze();
+    expect(confirmA11y.violations).toEqual([]);
+
+    await confirmDeleteBtn.click();
+    await expect(page.getByText(/Deleted study \(2 series, 1 frames\)/)).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'No DICOM Series Selected' })).toBeVisible();
+    await expect(page.getByRole('list', { name: 'DICOM Studies' }).locator('li')).toHaveCount(0);
 
     // Verify no PHI/state is written to browser storage
     const storageCounts = await page.evaluate(() => ({

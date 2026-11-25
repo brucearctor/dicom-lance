@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import {
+  apiFetch,
+  ApiUnauthorizedError,
+  deleteStudy,
   fetchStats,
+  getAuthToken,
   ingestDirectory,
   type SearchMode,
   searchStudies,
   seedPhantoms,
+  setAuthToken,
   uploadDicomFiles,
   type SeriesSummary,
   type StoreStats,
@@ -20,6 +25,54 @@ const SEARCH_MODES: { id: SearchMode; label: string }[] = [
   { id: 'vector', label: 'Vector' },
 ];
 
+function SeriesThumbnail({ url, modality }: { url: string | null; modality: string }) {
+  const hasToken = Boolean(getAuthToken());
+  const [blobSrc, setBlobSrc] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!url || !hasToken) {
+      setBlobSrc(null);
+      return;
+    }
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    void apiFetch(url)
+      .then((res) => (res.ok ? res.blob() : null))
+      .then((blob) => {
+        if (cancelled || !blob) return;
+        objectUrl = URL.createObjectURL(blob);
+        setBlobSrc(objectUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setBlobSrc(null);
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [url, hasToken]);
+
+  const effectiveSrc = url ? (hasToken ? blobSrc : url) : null;
+  if (!effectiveSrc) {
+    return (
+      <div className="series-thumb-placeholder" aria-hidden="true">
+        {modality}
+      </div>
+    );
+  }
+  return (
+    <img
+      src={effectiveSrc}
+      alt={`${modality} thumbnail`}
+      className="series-thumb"
+      width={44}
+      height={44}
+    />
+  );
+}
+
 export function App() {
   const [studies, setStudies] = useState<StudySummary[]>([]);
   const [selectedSeries, setSelectedSeries] = useState<SeriesSummary | null>(null);
@@ -31,10 +84,25 @@ export function App() {
   const [statusMessage, setStatusMessage] = useState('Initializing Lance v2.2 catalog...');
   const [busy, setBusy] = useState(false);
 
+  const [authRequired, setAuthRequired] = useState(false);
+  const [tokenInput, setTokenInput] = useState('');
+  const [confirmDeleteStudyUid, setConfirmDeleteStudyUid] = useState<string | null>(null);
+
   const [dirPath, setDirPath] = useState('');
   const [selectedFiles, setSelectedFiles] = useState<FileList | null>(null);
+  const [deidentifyUpload, setDeidentifyUpload] = useState(false);
   const uploadDialogRef = useRef<HTMLDialogElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleApiError = useCallback((err: unknown, fallback: string) => {
+    if (err instanceof ApiUnauthorizedError) {
+      setAuthToken(null);
+      setAuthRequired(true);
+      setStatusMessage('Authentication required: enter bearer token to unlock catalog.');
+      return;
+    }
+    setStatusMessage(err instanceof Error ? err.message : fallback);
+  }, []);
 
   const refreshData = useCallback(
     async (nextQuery: string, nextModality: string, nextMode: SearchMode) => {
@@ -42,6 +110,7 @@ export function App() {
         searchStudies(nextQuery, nextModality, nextMode),
         fetchStats(),
       ]);
+      setAuthRequired(false);
       setStudies(studyResults);
       setStats(nextStats);
       setSelectedSeries((prev) => {
@@ -75,12 +144,12 @@ export function App() {
 
   useEffect(() => {
     void refreshData('', 'ALL', 'hybrid').catch((err) => {
-      setStatusMessage(err instanceof Error ? err.message : 'Failed to load catalog');
+      handleApiError(err, 'Failed to load catalog');
     });
     return () => {
       purgeCornerstoneMemory();
     };
-  }, [refreshData]);
+  }, [refreshData, handleApiError]);
 
   // Progressive fallback for browsers without native <dialog closedby="any">
   useEffect(() => {
@@ -108,13 +177,57 @@ export function App() {
     };
   }, []);
 
+  const handleTokenUnlock = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!tokenInput.trim()) return;
+    setAuthToken(tokenInput);
+    setBusy(true);
+    try {
+      await refreshData(query, modality, searchMode);
+      setTokenInput('');
+      setAuthRequired(false);
+    } catch (err) {
+      handleApiError(err, 'Authentication failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleLockSession = () => {
+    setAuthToken(null);
+    setStudies([]);
+    setSelectedSeries(null);
+    setConfirmDeleteStudyUid(null);
+    setAuthRequired(true);
+    setStatusMessage('Session locked: bearer token cleared from memory.');
+  };
+
+  const handleConfirmDeleteStudy = async (studyUid: string) => {
+    setBusy(true);
+    try {
+      const report = await deleteStudy(studyUid);
+      setConfirmDeleteStudyUid(null);
+      if (selectedSeries?.study_instance_uid === studyUid) {
+        setSelectedSeries(null);
+      }
+      await refreshData(query, modality, searchMode);
+      setStatusMessage(
+        `Deleted study (${report.series_deleted} series, ${report.frames_deleted} frames).`,
+      );
+    } catch (err) {
+      handleApiError(err, 'Delete study failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleSearchSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setBusy(true);
     try {
       await refreshData(query, modality, searchMode);
     } catch (err) {
-      setStatusMessage(err instanceof Error ? err.message : 'Search failed');
+      handleApiError(err, 'Search failed');
     } finally {
       setBusy(false);
     }
@@ -126,7 +239,7 @@ export function App() {
     try {
       await refreshData(query, nextModality, searchMode);
     } catch (err) {
-      setStatusMessage(err instanceof Error ? err.message : 'Filter failed');
+      handleApiError(err, 'Filter failed');
     } finally {
       setBusy(false);
     }
@@ -139,7 +252,7 @@ export function App() {
     try {
       await refreshData(query, modality, nextMode);
     } catch (err) {
-      setStatusMessage(err instanceof Error ? err.message : 'Search failed');
+      handleApiError(err, 'Search failed');
     } finally {
       setBusy(false);
     }
@@ -166,7 +279,7 @@ export function App() {
         `Ingested ${report.series_ingested} series (${report.frames_ingested} frames) into Lance v2.2.`,
       );
     } catch (err) {
-      setStatusMessage(err instanceof Error ? err.message : 'Phantom seed failed');
+      handleApiError(err, 'Phantom seed failed');
     } finally {
       setBusy(false);
     }
@@ -184,19 +297,25 @@ export function App() {
     if (dialog) {
       dialog.returnValue = '';
     }
+    setDeidentifyUpload(false);
   };
 
   const handleUploadSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setBusy(true);
+    const useDeid = Boolean(stats?.deidentify_enabled) || deidentifyUpload;
     try {
       let report;
       if (selectedFiles && selectedFiles.length > 0) {
-        report = await uploadDicomFiles(selectedFiles);
-      } else if (dirPath.trim()) {
-        report = await ingestDirectory(dirPath.trim());
+        report = await uploadDicomFiles(selectedFiles, useDeid);
+      } else if (dirPath.trim() && stats?.allow_directory_ingest !== false) {
+        report = await ingestDirectory(dirPath.trim(), useDeid);
       } else {
-        setStatusMessage('Choose one or more .dcm files or enter a local directory path.');
+        setStatusMessage(
+          stats?.allow_directory_ingest === false
+            ? 'Choose one or more .dcm files (server directory ingest is disabled).'
+            : 'Choose one or more .dcm files or enter a local directory path.',
+        );
         setBusy(false);
         return;
       }
@@ -205,13 +324,14 @@ export function App() {
       }
       setSelectedFiles(null);
       setDirPath('');
+      setDeidentifyUpload(false);
       uploadDialogRef.current?.close();
       await refreshData(query, modality, searchMode);
       setStatusMessage(
         `Ingested ${report.series_ingested} series (${report.frames_ingested} frames) into Lance v2.2.`,
       );
     } catch (err) {
-      setStatusMessage(err instanceof Error ? err.message : 'Ingest failed');
+      handleApiError(err, 'Ingest failed');
     } finally {
       setBusy(false);
     }
@@ -244,15 +364,20 @@ export function App() {
         </div>
 
         <div className="topbar-actions">
+          {!authRequired && stats?.auth_enabled && (
+            <button type="button" className="btn" onClick={handleLockSession}>
+              Lock Session
+            </button>
+          )}
           <button
             type="button"
             className="btn btn-primary"
-            disabled={busy}
+            disabled={busy || authRequired}
             onClick={() => void handleSeedPhantoms()}
           >
             Seed 3D Phantoms
           </button>
-          <button type="button" className="btn" onClick={openUploadDialog}>
+          <button type="button" className="btn" disabled={authRequired} onClick={openUploadDialog}>
             Upload DICOM
           </button>
         </div>
@@ -260,6 +385,35 @@ export function App() {
 
       <div className="workspace-grid">
         <aside className="sidebar scroller" aria-label="Studies and Series">
+          {authRequired && (
+            <form
+              className="study-card auth-unlock-form"
+              aria-label="Bearer Token Authentication"
+              onSubmit={(e) => void handleTokenUnlock(e)}
+            >
+              <label htmlFor="api-bearer-token" className="search-label">
+                Bearer Token (RAM-only session)
+              </label>
+              <div className="search-row">
+                <input
+                  id="api-bearer-token"
+                  type="password"
+                  className="text-input"
+                  autoComplete="off"
+                  placeholder="Enter API_TOKEN..."
+                  value={tokenInput}
+                  onChange={(e) => setTokenInput(e.target.value)}
+                />
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={busy || !tokenInput.trim()}
+                >
+                  Unlock
+                </button>
+              </div>
+            </form>
+          )}
           <search>
             <form
               className="search-form"
@@ -347,12 +501,49 @@ export function App() {
                     </div>
                     <div className="study-meta">{study.study_description}</div>
                   </div>
-                  {study.max_score !== null && (
-                    <span className="pill">
-                      {scoreBadgePrefix}{' '}
-                      {study.max_score.toFixed(searchMode === 'hybrid' ? 4 : 2)}
-                    </span>
-                  )}
+                  <div className="study-actions">
+                    {study.max_score !== null && (
+                      <span className="pill">
+                        {scoreBadgePrefix}{' '}
+                        {study.max_score.toFixed(searchMode === 'hybrid' ? 4 : 2)}
+                      </span>
+                    )}
+                    {confirmDeleteStudyUid === study.study_instance_uid ? (
+                      <div
+                        className="delete-confirm-group"
+                        role="group"
+                        aria-label={`Confirm delete ${study.patient_name}`}
+                      >
+                        <button
+                          type="button"
+                          className="btn btn-danger"
+                          disabled={busy}
+                          aria-label={`Confirm delete ${study.patient_name}`}
+                          onClick={() => void handleConfirmDeleteStudy(study.study_instance_uid)}
+                        >
+                          Confirm
+                        </button>
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={busy}
+                          onClick={() => setConfirmDeleteStudyUid(null)}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn btn-danger-outline"
+                        disabled={busy}
+                        aria-label={`Delete study ${study.patient_name}`}
+                        onClick={() => setConfirmDeleteStudyUid(study.study_instance_uid)}
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 <div className="series-list">
@@ -367,19 +558,7 @@ export function App() {
                         aria-current={isSelected ? 'true' : undefined}
                         onClick={() => setSelectedSeries(ser)}
                       >
-                        {ser.thumbnail_url ? (
-                          <img
-                            src={ser.thumbnail_url}
-                            alt={`${ser.modality} thumbnail`}
-                            className="series-thumb"
-                            width={44}
-                            height={44}
-                          />
-                        ) : (
-                          <div className="series-thumb-placeholder" aria-hidden="true">
-                            {ser.modality}
-                          </div>
-                        )}
+                        <SeriesThumbnail url={ser.thumbnail_url} modality={ser.modality} />
                         <div className="series-info">
                           <span className="series-title">
                             [{ser.modality}] {ser.series_description}
@@ -433,20 +612,41 @@ export function App() {
               onChange={(e) => setSelectedFiles(e.target.files)}
             />
           </div>
-          <div className="field-group">
-            <label htmlFor="dcm-dir-path">Or scan a local server directory path</label>
+          {stats?.allow_directory_ingest !== false ? (
+            <div className="field-group">
+              <label htmlFor="dcm-dir-path">Or scan a local server directory path</label>
+              <input
+                id="dcm-dir-path"
+                name="directory_path"
+                type="text"
+                className="text-input"
+                placeholder="/path/to/dicom/study"
+                value={dirPath}
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                onChange={(e) => setDirPath(e.target.value)}
+              />
+            </div>
+          ) : (
+            <p className="study-meta">
+              Server filesystem directory ingest is disabled by server security policy.
+            </p>
+          )}
+          <div className="checkbox-row">
             <input
-              id="dcm-dir-path"
-              name="directory_path"
-              type="text"
-              className="text-input"
-              placeholder="/path/to/dicom/study"
-              value={dirPath}
-              autoCorrect="off"
-              autoCapitalize="none"
-              spellCheck={false}
-              onChange={(e) => setDirPath(e.target.value)}
+              id="dcm-deidentify"
+              name="deidentify"
+              type="checkbox"
+              className="deid-checkbox"
+              checked={Boolean(stats?.deidentify_enabled) || deidentifyUpload}
+              disabled={Boolean(stats?.deidentify_enabled)}
+              onChange={(e) => setDeidentifyUpload(e.target.checked)}
             />
+            <label htmlFor="dcm-deidentify">
+              De-identify PHI (DICOM PS3.15 Basic Profile)
+              {stats?.deidentify_enabled ? ' — Enforced by server' : ''}
+            </label>
           </div>
           <div className="dialog-actions">
             <button

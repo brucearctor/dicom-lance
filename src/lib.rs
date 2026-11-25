@@ -1,5 +1,6 @@
 pub mod api;
 pub mod codecs;
+pub mod deid;
 pub mod dicom_ingest;
 pub mod embedding;
 pub mod phantom;

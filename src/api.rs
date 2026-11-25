@@ -6,35 +6,65 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State};
-use axum::http::header::{ACCEPT, CONTENT_TYPE, RANGE};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RANGE, WWW_AUTHENTICATE};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use tower_http::cors::{Any, CorsLayer};
+use sha2::{Digest, Sha256};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::codecs::{
     negotiate_wado_accept, transcode_frame_for_wado, SUPPORTED_WADO_TRANSFER_SYNTAXES,
 };
-use crate::dicom_ingest::{parse_dicom_instances, IngestError};
+use crate::deid::DeidConfig;
+use crate::dicom_ingest::{parse_dicom_instances_with_deid, IngestError};
 use crate::phantom::{generate_phantom_dicom_files, PhantomError};
-use crate::store::{DicomLanceStore, IngestReport, SearchMode, StoreError, StudySummary};
+use crate::store::{
+    DicomLanceStore, IngestReport, MaintenanceOptions, SearchMode, StoreError, StoreStats,
+    StudySummary,
+};
 
 const WADO_BOUNDARY: &str = "dicom-lance-boundary";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConfig {
+    pub api_token: Option<String>,
+    pub cors_origins: Vec<String>,
+    pub allow_directory_ingest: bool,
+    pub deid: DeidConfig,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            api_token: None,
+            cors_origins: Vec::new(),
+            allow_directory_ingest: true,
+            deid: DeidConfig::default(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<DicomLanceStore>,
+    pub config: Arc<ServerConfig>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    Unauthorized(String),
+    #[error("{0}")]
+    Forbidden(String),
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
@@ -57,6 +87,17 @@ impl From<PhantomError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let ApiError::Unauthorized(msg) = self {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(
+                    WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Bearer realm=\"dicom-lance\""),
+                )],
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
         if let ApiError::NotAcceptable(msg) = self {
             return (
                 StatusCode::NOT_ACCEPTABLE,
@@ -69,6 +110,8 @@ impl IntoResponse for ApiError {
         }
         let (status, msg) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
+            ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::NotAcceptable(m) => (StatusCode::NOT_ACCEPTABLE, m),
             ApiError::Store(StoreError::NotFound(m)) => (StatusCode::NOT_FOUND, m),
@@ -79,6 +122,87 @@ impl IntoResponse for ApiError {
             other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         };
         (status, Json(serde_json::json!({ "error": msg }))).into_response()
+    }
+}
+
+/// Compares bearer tokens in fixed time via SHA-256 digest folding.
+pub fn constant_time_token_eq(expected: &str, candidate: &str) -> bool {
+    let a = Sha256::digest(expected.as_bytes());
+    let b = Sha256::digest(candidate.as_bytes());
+    let mut diff: u8 = 0;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0 && expected.len() == candidate.len()
+}
+
+/// Validates explicit HTTP/HTTPS origin strings (`scheme://host[:port]`) for CORS allowlists.
+pub fn parse_cors_origins(origins: &[String]) -> Result<Vec<HeaderValue>, String> {
+    let mut out = Vec::with_capacity(origins.len());
+    for raw in origins {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        {
+            return Err(format!("invalid CORS origin: {raw:?}"));
+        }
+        let authority = trimmed
+            .strip_prefix("https://")
+            .or_else(|| trimmed.strip_prefix("http://"))
+            .ok_or_else(|| format!("CORS origin must use http:// or https://: {trimmed}"))?;
+        if authority.is_empty()
+            || authority.contains(['/', '?', '#', '@'])
+            || authority.starts_with(':')
+            || authority.ends_with(':')
+        {
+            return Err(format!("invalid CORS origin authority: {trimmed}"));
+        }
+        let hv = HeaderValue::from_str(trimmed)
+            .map_err(|e| format!("invalid CORS header value {trimmed}: {e}"))?;
+        out.push(hv);
+    }
+    Ok(out)
+}
+
+async fn require_bearer_auth(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if req.method() == Method::OPTIONS {
+        return next.run(req).await;
+    }
+    if let Some(expected) = state.config.api_token.as_deref().filter(|s| !s.is_empty()) {
+        let provided = req
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|raw| {
+                let trimmed = raw.trim();
+                if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+                    Some(trimmed[7..].trim())
+                } else {
+                    None
+                }
+            });
+        match provided {
+            Some(tok) if constant_time_token_eq(expected, tok) => {}
+            _ => {
+                return ApiError::Unauthorized("missing or invalid bearer token".to_string())
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
+fn effective_deid(base: &DeidConfig, override_flag: Option<bool>) -> Option<DeidConfig> {
+    if base.enabled || override_flag.unwrap_or(false) {
+        let mut cfg = base.clone();
+        cfg.enabled = true;
+        Some(cfg)
+    } else {
+        None
     }
 }
 
@@ -97,6 +221,11 @@ pub struct SimilarParams {
     pub exclude_self: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct IngestQuery {
+    pub deidentify: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
     pub mode: SearchMode,
@@ -106,16 +235,50 @@ pub struct SearchResponse {
 #[derive(Debug, Deserialize)]
 pub struct DirectoryIngestRequest {
     pub path: String,
+    #[serde(default)]
+    pub deidentify: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct MaintenanceRequest {
+    pub retain_versions: Option<usize>,
+    pub delete_unverified: Option<bool>,
+    pub materialize_deletions_threshold: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiStatsResponse {
+    #[serde(flatten)]
+    pub stats: StoreStats,
+    pub deidentify_enabled: bool,
+    pub auth_enabled: bool,
+    pub allow_directory_ingest: bool,
 }
 
 pub fn build_router(store: Arc<DicomLanceStore>, static_dir: Option<PathBuf>) -> Router {
-    let state = AppState { store };
+    build_router_with_config(store, static_dir, ServerConfig::default())
+}
 
-    let api_router = Router::new()
-        .route("/healthz", get(healthz))
+pub fn build_router_with_config(
+    store: Arc<DicomLanceStore>,
+    static_dir: Option<PathBuf>,
+    config: ServerConfig,
+) -> Router {
+    let parsed_origins = parse_cors_origins(&config.cors_origins)
+        .expect("CORS origins should be validated at server startup");
+    let has_cors_allowlist = !parsed_origins.is_empty();
+    let config_arc = Arc::new(config);
+    let state = AppState {
+        store,
+        config: config_arc,
+    };
+
+    let protected_router = Router::new()
         .route("/api/stats", get(get_stats))
         .route("/api/cache/invalidate", post(invalidate_cache))
         .route("/api/search", get(search_get).post(search_post))
+        .route("/api/studies/{study}", delete(delete_study))
+        .route("/api/maintenance/compact", post(compact_datasets))
         .route(
             "/api/studies/{study}/series/{series}/frames-manifest",
             get(get_frames_manifest),
@@ -146,20 +309,41 @@ pub fn build_router(store: Arc<DicomLanceStore>, static_dir: Option<PathBuf>) ->
             get(wado_instance_frames),
         )
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_auth,
+        ))
         .with_state(state);
+
+    let base_router = Router::new()
+        .route("/healthz", get(healthz))
+        .merge(protected_router);
 
     let router = if let Some(dir) = static_dir.filter(|p| p.exists()) {
         let index_path = dir.join("index.html");
         let serve = ServeDir::new(&dir).not_found_service(ServeFile::new(index_path));
-        api_router.fallback_service(serve)
+        base_router.fallback_service(serve)
     } else {
-        api_router
+        base_router
     };
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = if has_cors_allowlist {
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(parsed_origins))
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT, RANGE])
+    } else {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    };
+
+    let corp_value = if has_cors_allowlist {
+        HeaderValue::from_static("cross-origin")
+    } else {
+        HeaderValue::from_static("same-origin")
+    };
 
     router
         .layer(cors)
@@ -173,7 +357,7 @@ pub fn build_router(store: Arc<DicomLanceStore>, static_dir: Option<PathBuf>) ->
         ))
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::header::HeaderName::from_static("cross-origin-resource-policy"),
-            HeaderValue::from_static("same-origin"),
+            corp_value,
         ))
 }
 
@@ -181,15 +365,52 @@ async fn healthz() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+fn build_api_stats_response(stats: StoreStats, cfg: &ServerConfig) -> ApiStatsResponse {
+    ApiStatsResponse {
+        stats,
+        deidentify_enabled: cfg.deid.enabled,
+        auth_enabled: cfg.api_token.as_deref().is_some_and(|t| !t.is_empty()),
+        allow_directory_ingest: cfg.allow_directory_ingest,
+    }
+}
+
 async fn get_stats(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let stats = state.store.get_stats().await?;
-    Ok(Json(stats))
+    Ok(Json(build_api_stats_response(stats, &state.config)))
 }
 
 async fn invalidate_cache(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     state.store.invalidate_cache().await;
     let stats = state.store.get_stats().await?;
-    Ok(Json(stats))
+    Ok(Json(build_api_stats_response(stats, &state.config)))
+}
+
+async fn delete_study(
+    State(state): State<AppState>,
+    AxumPath(study): AxumPath<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let report = state.store.delete_study(&study).await?;
+    Ok(Json(report))
+}
+
+async fn compact_datasets(
+    State(state): State<AppState>,
+    body: Option<Json<MaintenanceRequest>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let defaults = MaintenanceOptions::default();
+    let req = body.map(|Json(v)| v).unwrap_or_default();
+    let opts = MaintenanceOptions {
+        retain_versions: req
+            .retain_versions
+            .unwrap_or(defaults.retain_versions)
+            .max(1),
+        delete_unverified: req.delete_unverified.unwrap_or(defaults.delete_unverified),
+        materialize_deletions_threshold: req
+            .materialize_deletions_threshold
+            .unwrap_or(defaults.materialize_deletions_threshold),
+    };
+    let report = state.store.compact_and_cleanup(&opts).await?;
+    Ok(Json(report))
 }
 
 async fn search_get(
@@ -290,6 +511,13 @@ async fn get_series_thumbnail(
 }
 
 pub async fn seed_phantoms_into_store(store: &DicomLanceStore) -> Result<IngestReport, ApiError> {
+    seed_phantoms_into_store_with_deid(store, None).await
+}
+
+pub async fn seed_phantoms_into_store_with_deid(
+    store: &DicomLanceStore,
+    deid: Option<DeidConfig>,
+) -> Result<IngestReport, ApiError> {
     let (phantom_dir, cleanup_dir) = if let Some(local_root) = store.local_root_dir() {
         (local_root.join("phantoms"), None)
     } else {
@@ -309,20 +537,25 @@ pub async fn seed_phantoms_into_store(store: &DicomLanceStore) -> Result<IngestR
     let paths = tokio::task::spawn_blocking(move || generate_phantom_dicom_files(&gen_dir))
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))??;
-    let result = ingest_paths(store, &paths).await;
+    let result = ingest_paths(store, &paths, deid).await;
     if let Some(dir) = cleanup_dir {
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
     result
 }
 
-async fn seed_phantoms(State(state): State<AppState>) -> Result<Json<IngestReport>, ApiError> {
-    let report = seed_phantoms_into_store(&state.store).await?;
+async fn seed_phantoms(
+    State(state): State<AppState>,
+    Query(query): Query<IngestQuery>,
+) -> Result<Json<IngestReport>, ApiError> {
+    let deid = effective_deid(&state.config.deid, query.deidentify);
+    let report = seed_phantoms_into_store_with_deid(&state.store, deid).await?;
     Ok(Json(report))
 }
 
 async fn ingest_upload(
     State(state): State<AppState>,
+    Query(query): Query<IngestQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<IngestReport>, ApiError> {
     let mut buffers = Vec::new();
@@ -344,9 +577,11 @@ async fn ingest_upload(
             "no DICOM files uploaded in multipart request".to_string(),
         ));
     }
-    let parsed = tokio::task::spawn_blocking(move || parse_dicom_instances(&buffers))
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))??;
+    let deid = effective_deid(&state.config.deid, query.deidentify);
+    let parsed =
+        tokio::task::spawn_blocking(move || parse_dicom_instances_with_deid(&buffers, deid.as_ref()))
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))??;
     let report = state.store.ingest(&parsed).await?;
     Ok(Json(report))
 }
@@ -371,15 +606,21 @@ fn collect_dcm_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(),
     Ok(())
 }
 
-async fn ingest_paths(store: &DicomLanceStore, paths: &[PathBuf]) -> Result<IngestReport, ApiError> {
+async fn ingest_paths(
+    store: &DicomLanceStore,
+    paths: &[PathBuf],
+    deid: Option<DeidConfig>,
+) -> Result<IngestReport, ApiError> {
     let mut raw_files = Vec::with_capacity(paths.len());
     for p in paths {
         let bytes = tokio::fs::read(p).await?;
         raw_files.push(Bytes::from(bytes));
     }
-    let parsed = tokio::task::spawn_blocking(move || parse_dicom_instances(&raw_files))
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))??;
+    let parsed = tokio::task::spawn_blocking(move || {
+        parse_dicom_instances_with_deid(&raw_files, deid.as_ref())
+    })
+    .await
+    .map_err(|e| ApiError::BadRequest(e.to_string()))??;
     let report = store.ingest(&parsed).await?;
     Ok(report)
 }
@@ -388,6 +629,11 @@ async fn ingest_directory(
     State(state): State<AppState>,
     Json(req): Json<DirectoryIngestRequest>,
 ) -> Result<Json<IngestReport>, ApiError> {
+    if !state.config.allow_directory_ingest {
+        return Err(ApiError::Forbidden(
+            "directory ingestion is disabled on this server".to_string(),
+        ));
+    }
     let dir = PathBuf::from(&req.path);
     if !dir.is_dir() {
         return Err(ApiError::BadRequest(format!(
@@ -409,7 +655,8 @@ async fn ingest_directory(
             req.path
         )));
     }
-    let report = ingest_paths(&state.store, &paths).await?;
+    let deid = effective_deid(&state.config.deid, req.deidentify);
+    let report = ingest_paths(&state.store, &paths, deid).await?;
     Ok(Json(report))
 }
 
@@ -510,6 +757,7 @@ pub fn split_multipart_related(body: &[u8], boundary: &str) -> Vec<Bytes> {
 
 async fn stow_studies(
     State(state): State<AppState>,
+    Query(query): Query<IngestQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -535,9 +783,11 @@ async fn stow_studies(
         return Err(ApiError::BadRequest("empty STOW-RS body".to_string()));
     };
 
-    let parsed = tokio::task::spawn_blocking(move || parse_dicom_instances(&buffers))
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))??;
+    let deid = effective_deid(&state.config.deid, query.deidentify);
+    let parsed =
+        tokio::task::spawn_blocking(move || parse_dicom_instances_with_deid(&buffers, deid.as_ref()))
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))??;
     let report = state.store.ingest(&parsed).await?;
 
     let resp_json = serde_json::json!({
@@ -753,10 +1003,22 @@ pub async fn serve_with_store(
     static_dir: Option<PathBuf>,
     seed_on_start: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    serve_with_config(addr, store, static_dir, seed_on_start, ServerConfig::default()).await
+}
+
+pub async fn serve_with_config(
+    addr: SocketAddr,
+    store: Arc<DicomLanceStore>,
+    static_dir: Option<PathBuf>,
+    seed_on_start: bool,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    parse_cors_origins(&config.cors_origins)?;
     if seed_on_start {
         let stats = store.get_stats().await?;
         if stats.series_dataset.row_count == 0 {
-            let report = seed_phantoms_into_store(&store).await?;
+            let deid = config.deid.enabled.then(|| config.deid.clone());
+            let report = seed_phantoms_into_store_with_deid(&store, deid).await?;
             tracing::info!(
                 series = report.series_ingested,
                 frames = report.frames_ingested,
@@ -765,7 +1027,7 @@ pub async fn serve_with_store(
         }
     }
 
-    let router = build_router(store, static_dir);
+    let router = build_router_with_config(store, static_dir, config);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "dicom-lance server listening");
     axum::serve(listener, router).await?;

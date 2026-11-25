@@ -25,6 +25,7 @@ import {
   fetchSeriesSegmentations,
   fetchSimilarFrames,
   type FrameDescriptor,
+  getAuthHeaders,
   type SegmentationMetadata,
   type SeriesSummary,
   type SimilarFrameHit,
@@ -534,6 +535,7 @@ export function DicomWorkspace({
           const url = `/dicomweb/studies/${series.study_instance_uid}/series/${layer.seg.seg_series_instance_uid}/instances/${layer.seg.seg_sop_instance_uid}/frames/${layer.mapping.seg_frame_number}`;
           const res = await fetch(url, {
             headers: {
+              ...getAuthHeaders(),
               Accept:
                 'multipart/related; type="application/octet-stream"; transfer-syntax=1.2.840.10008.1.2.1',
             },

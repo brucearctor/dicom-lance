@@ -1,10 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildSearchUrl,
   buildWadoImageId,
+  compactDatasets,
   computeVoiRange,
+  deleteStudy,
   type FrameDescriptor,
+  getAuthHeaders,
+  getAuthToken,
   type SegmentationMetadata,
+  setAuthToken,
+  uploadDicomFiles,
 } from '../api/client';
 import { resolveEnhancedFrameMetadata } from '../cornerstone/seriesMapping';
 import {
@@ -206,5 +212,48 @@ describe('DICOM Lance API helpers', () => {
     // px 3: core composited over halo has red-dominant blended alpha > 200
     expect(rgba[12]).toBeGreaterThan(235);
     expect(rgba[15]).toBeGreaterThan(200);
+  });
+
+  it('manages RAM-only bearer auth headers, de-ID upload query, deleteStudy, and compactDatasets', async () => {
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ series_ingested: 1, frames_ingested: 1, study_uids: ['1.2.3'] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    expect(getAuthToken()).toBeNull();
+    expect(getAuthHeaders()).toEqual({});
+
+    setAuthToken('  tok-123  ');
+    expect(getAuthToken()).toBe('tok-123');
+    expect(getAuthHeaders()).toEqual({ Authorization: 'Bearer tok-123' });
+
+    const file = new File([new Uint8Array([1, 2, 3])], 'sample.dcm', { type: 'application/dicom' });
+    await uploadDicomFiles([file], true);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [uploadUrl, uploadInit] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(uploadUrl).toBe('/api/ingest/upload?deidentify=true');
+    expect(new Headers(uploadInit.headers).get('Authorization')).toBe('Bearer tok-123');
+
+    await deleteStudy('1.2.3');
+    const [delUrl, delInit] = fetchSpy.mock.calls[1] as unknown as [string, RequestInit];
+    expect(delUrl).toBe('/api/studies/1.2.3');
+    expect(delInit.method).toBe('DELETE');
+
+    await compactDatasets({ retain_versions: 1, delete_unverified: true });
+    const [cmpUrl, cmpInit] = fetchSpy.mock.calls[2] as unknown as [string, RequestInit];
+    expect(cmpUrl).toBe('/api/maintenance/compact');
+    expect(cmpInit.method).toBe('POST');
+
+    setAuthToken(null);
+    expect(getAuthToken()).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    setAuthToken(null);
+    vi.unstubAllGlobals();
   });
 });

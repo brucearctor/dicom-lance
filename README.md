@@ -46,6 +46,29 @@ flowchart LR
 - **Enhanced Multi-Frame CT/MR (`src/dicom_ingest.rs`, `web/src/cornerstone/seriesMapping.ts`)**: Extracts Shared (`5200,9229`) and Per-Frame (`5200,9230`) Functional Groups (`PlanePositionSequence`, `PlaneOrientationSequence`, `PixelMeasuresSequence`, `FrameVOILUTSequence`, `PixelValueTransformationSequence`) for per-frame 3D normal slice sorting, `spacing_z_mm` calculation, and Cornerstone3D per-frame metadata projection.
 - **DICOM SEG Storage & Viewer Overlay (`src/seg.rs`, `src/phantom.rs`, `web/src/cornerstone/`)**: Unpacks 1-bit packed (`BitsAllocated=1`) binary segmentations into 8-bit Lance Blob V2 frames, decodes `SegmentSequence` labels and `RecommendedDisplayCIELabValue` colors to sRGB, exposes `GET /api/studies/{study}/series/{series}/segmentations`, seeds a 16-frame **RUL Spiculated Nodule DICOM SEG** phantom (`4` series / `128` frames total), excludes `SEG` planes from CT/MR slice KNN, and renders an affine-aligned translucent lesion mask & legend via **"SEG Overlay"** in the 2D Stack viewer.
 
+## Production Hardening & Storage Lifecycle
+
+- **PS3.15 De-identification (`src/deid.rs`)**: Enable server-wide via `--deidentify` (`DEIDENTIFY=true`) with `--deidentify-salt` (`DEIDENTIFY_SALT`), or per request via `?deidentify=true` on upload / STOW-RS / seed endpoints (`De-identify PHI` checkbox in the Upload modal). Strips private tags and direct PHI/observer attributes, generalizes dates, pseudonymizes patient identifiers, and deterministically remaps Study/Series/SOP/FrameOfReference UIDs so multi-series `CT`/`SR`/`SEG` links remain intact.
+- **Bearer Auth & CORS Allowlist (`src/api.rs`, `src/main.rs`)**: Enable fixed-time `Authorization: Bearer` checks on all `/api/*` and `/dicomweb/*` routes with `--api-token` (`API_TOKEN`) and restrict origins with repeatable `--cors-origin` (`CORS_ORIGINS`). Binding a non-loopback `--host` automatically disables `/api/ingest/directory` (`403 Forbidden`) unless `--allow-directory-ingest` is explicitly set.
+- **Study Deletion & Lance Compaction (`src/store.rs`)**: Remove studies across both Lance datasets via `DELETE /api/studies/{study}` (or two-step `Delete` -> `Confirm` in the sidebar) and compact deleted fragments & old versions/blobs via `POST /api/maintenance/compact`:
+
+```bash
+# Hardened server startup with PS3.15 de-identification, Bearer auth, and CORS allowlist
+API_TOKEN="replace-with-strong-token" DEIDENTIFY=true DEIDENTIFY_SALT="site-secret-salt" \
+  CORS_ORIGINS="https://viewer.example.org" cargo run --release -- --port 8090 --data-dir ./data
+
+# Upload DICOM with per-request PS3.15 de-identification enabled
+curl -sf -H "Authorization: Bearer replace-with-strong-token" \
+  -F "files=@/path/to/slice.dcm" "http://127.0.0.1:8090/api/ingest/upload?deidentify=true" | jq
+
+# Delete a study and compact/prune superseded Lance fragments and Blob V2 data files
+curl -sf -X DELETE -H "Authorization: Bearer replace-with-strong-token" \
+  "http://127.0.0.1:8090/api/studies/1.2.826.0.1.3680043.10.5432.1001" | jq
+curl -sf -X POST -H "Authorization: Bearer replace-with-strong-token" \
+  -H "Content-Type: application/json" -d '{"retain_versions":1,"delete_unverified":true}' \
+  "http://127.0.0.1:8090/api/maintenance/compact" | jq
+```
+
 ## Quickstart
 
 ### Local Build
@@ -117,7 +140,7 @@ npm run test:e2e:live
 ## Security & Clinical Disclaimer
 
 - **Research / Non-Diagnostic Use Only**: `dicom-lance` is an experimental reference implementation. It is **not** FDA-cleared, CE-marked, or intended for primary clinical diagnosis.
-- **Network Exposure**: By default the HTTP server binds to `127.0.0.1:8090` with permissive CORS and **no built-in authentication**. Place it behind TLS, authentication, and authorization before serving real patient data or exposing it beyond localhost. See [SECURITY.md](SECURITY.md) for deployment guidance.
+- **Network Exposure**: By default the HTTP server binds to `127.0.0.1:8090` without authentication enabled. For shared or network-exposed deployments, configure `--api-token` (`API_TOKEN`), `--cors-origin` (`CORS_ORIGINS`), `--deidentify` (`DEIDENTIFY=true`), and TLS termination via a reverse proxy before serving traffic. See [SECURITY.md](SECURITY.md) for deployment guidance.
 
 ## Contributing, Changelog & License
 

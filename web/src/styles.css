@@ -37,6 +37,9 @@
   --brand-text: var(--brand-text-light);
   --badge-bg: var(--badge-bg-light);
   --badge-text: var(--badge-text-light);
+  --danger-text-light: #b91c1c;
+  --danger-text-dark: #fca5a5;
+  --danger-text: var(--danger-text-light);
   --scrollbar-track: #e2e8f0;
   --scrollbar-thumb: #64748b;
 
@@ -51,6 +54,7 @@
     --brand-text: var(--brand-text-dark);
     --badge-bg: var(--badge-bg-dark);
     --badge-text: var(--badge-text-dark);
+    --danger-text: var(--danger-text-dark);
     --scrollbar-track: #0f172a;
     --scrollbar-thumb: #64748b;
   }
@@ -66,6 +70,7 @@
     --brand-text: light-dark(var(--brand-text-light), var(--brand-text-dark));
     --badge-bg: light-dark(var(--badge-bg-light), var(--badge-bg-dark));
     --badge-text: light-dark(var(--badge-text-light), var(--badge-text-dark));
+    --danger-text: light-dark(var(--danger-text-light), var(--danger-text-dark));
     --scrollbar-track: light-dark(#e2e8f0, #0f172a);
     --scrollbar-thumb: light-dark(#64748b, #94a3b8);
   }
@@ -296,6 +301,39 @@ select:focus-visible {
   align-items: flex-start;
   gap: 0.5rem;
   margin-bottom: 0.45rem;
+}
+
+.study-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.35rem;
+  flex-shrink: 0;
+}
+
+.delete-confirm-group {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.3rem;
+}
+
+.btn-danger {
+  background-color: #b91c1c;
+  color: #ffffff;
+  border-color: #b91c1c;
+}
+
+.btn-danger-outline {
+  background-color: var(--bg-surface);
+  color: var(--danger-text);
+  border-color: var(--danger-text);
+}
+
+.auth-unlock-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
 }
 
 .study-patient {
@@ -717,6 +755,23 @@ dialog.upload-dialog::backdrop {
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.deid-checkbox {
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  min-height: 24px;
+  margin: 0;
+  cursor: pointer;
 }
 
 @media (max-width: 960px) {

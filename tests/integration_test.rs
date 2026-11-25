@@ -8,14 +8,18 @@ use axum::{Json, Router};
 use dicom_core::value::{DataSetSequence, PixelFragmentSequence};
 use dicom_core::{DataElement, Length, PrimitiveValue, Tag, VR};
 use dicom_dictionary_std::{tags, uids};
-use dicom_lance::api::{build_router, seed_phantoms_into_store};
+use dicom_lance::api::{
+    build_router, build_router_with_config, seed_phantoms_into_store,
+    seed_phantoms_into_store_with_deid, ServerConfig,
+};
 use dicom_lance::codecs::{
     encode_rle_lossless_frame, TS_DEFLATED_IMAGE_FRAME, TS_EXPLICIT_VR_LE, TS_RLE_LOSSLESS,
 };
+use dicom_lance::deid::DeidConfig;
 use dicom_lance::embedding::{Embedder, HttpEmbedder};
 use dicom_lance::phantom::{
     generate_phantom_dicom_files, CT_DIM, CT_SEG_FRAMES, CT_SEG_SERIES_UID, CT_SERIES_UID,
-    CT_SLICES, CT_STUDY_UID, MR_SLICES,
+    CT_SLICES, CT_STUDY_UID, MR_SLICES, MR_STUDY_UID,
 };
 use dicom_lance::schema::EMBEDDING_DIM;
 use dicom_lance::seg::{rgb_to_dicom_cielab, SEGMENTATION_STORAGE_UID};
@@ -1480,4 +1484,477 @@ async fn enhanced_multiframe_and_dicom_seg_end_to_end() {
             .trim_end_matches('\0'),
         SEGMENTATION_STORAGE_UID
     );
+}
+
+#[tokio::test]
+async fn deidentification_ingest_and_seg_overlay_reference_preservation() {
+    let tmp = TempDir::new().unwrap();
+    let store = Arc::new(DicomLanceStore::new(tmp.path()));
+    let deid = DeidConfig::enabled_with_salt("test-salt-2026");
+    let app = build_router_with_config(
+        store.clone(),
+        None,
+        ServerConfig {
+            deid: deid.clone(),
+            ..Default::default()
+        },
+    );
+
+    let report = seed_phantoms_into_store_with_deid(&store, Some(deid.clone()))
+        .await
+        .unwrap();
+    assert_eq!(report.series_ingested, 4);
+    assert_eq!(report.frames_ingested, CT_SLICES + CT_SEG_FRAMES + MR_SLICES);
+
+    let expected_ct_study = deid.remap_uid(CT_STUDY_UID);
+    let expected_ct_series = deid.remap_uid(CT_SERIES_UID);
+    let expected_seg_series = deid.remap_uid(CT_SEG_SERIES_UID);
+    assert!(expected_ct_study.starts_with("2.25."));
+    assert_ne!(expected_ct_study, CT_STUDY_UID);
+
+    let search_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/search")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(search_res.status(), StatusCode::OK);
+    let search_bytes = search_res.into_body().collect().await.unwrap().to_bytes();
+    let search_text = String::from_utf8_lossy(&search_bytes);
+    for leaked in [
+        "Rivera^Elena",
+        "PAT-ONC-001",
+        "Chen^Marcus",
+        "PAT-NEURO-002",
+        "ACC-CT-2026-0142",
+        CT_STUDY_UID,
+        CT_SERIES_UID,
+    ] {
+        assert!(
+            !search_text.contains(leaked),
+            "de-identified catalog leaked original value: {leaked}"
+        );
+    }
+
+    // Verify PS3.15 audit tags in WADO-RS metadata for remapped CT series
+    let meta_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{expected_ct_study}/series/{expected_ct_series}/metadata"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(meta_res.status(), StatusCode::OK);
+    let meta_json: serde_json::Value =
+        serde_json::from_slice(&meta_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let first_meta = &meta_json.as_array().unwrap()[0];
+    assert_eq!(first_meta["00120062"]["Value"][0], "YES");
+    assert_eq!(
+        first_meta["00080016"]["Value"][0],
+        uids::CT_IMAGE_STORAGE
+    );
+
+    // Verify SEG references still resolve against remapped CT series + slice 23 SOP UID
+    let seg_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/studies/{expected_ct_study}/series/{expected_ct_series}/segmentations"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(seg_res.status(), StatusCode::OK);
+    let seg_json: serde_json::Value =
+        serde_json::from_slice(&seg_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let seg = &seg_json["segmentations"][0];
+    assert_eq!(seg["seg_series_instance_uid"], expected_seg_series);
+    assert_eq!(seg["referenced_series_uid"], expected_ct_series);
+
+    let remapped_slice23_sop = deid.remap_uid(&format!("{CT_SERIES_UID}.23"));
+    let slice23_core = seg["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| {
+            f["segment_number"] == 1
+                && f["referenced_sop_instance_uid"] == remapped_slice23_sop.as_str()
+        })
+        .expect("SEG slice 23 core reference after de-identification");
+    let seg_sop = seg["seg_sop_instance_uid"].as_str().unwrap();
+    let seg_frame = slice23_core["seg_frame_number"].as_i64().unwrap();
+
+    let wado_seg = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{expected_ct_study}/series/{expected_seg_series}/instances/{seg_sop}/frames/{seg_frame}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wado_seg.status(), StatusCode::OK);
+    let seg_part = extract_multipart_part(
+        &wado_seg.into_body().collect().await.unwrap().to_bytes(),
+        "dicom-lance-boundary",
+    );
+    assert_eq!(seg_part.len(), CT_DIM * CT_DIM);
+    assert_eq!(seg_part[86 * CT_DIM + 51], 255);
+
+    // Also test per-request ?deidentify=true when server default has deid.enabled = false
+    let req_tmp = TempDir::new().unwrap();
+    let req_store = Arc::new(DicomLanceStore::new(req_tmp.path()));
+    let req_app = build_router(req_store.clone(), None);
+    let raw_obj = build_uncompressed_test_obj(
+        "1.2.826.0.1.3680043.10.5432.8800",
+        "1.2.826.0.1.3680043.10.5432.8800.1",
+        "1.2.826.0.1.3680043.10.5432.8800.1.1",
+        8,
+        8,
+        16,
+        vec![0u8; 128],
+    );
+    let mut raw_bytes = Vec::new();
+    raw_obj.write_all(&mut raw_bytes).unwrap();
+    let bnd = "per-req-deid-bnd";
+    let mut form_body = Vec::new();
+    form_body.extend_from_slice(
+        format!("--{bnd}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"s.dcm\"\r\nContent-Type: application/dicom\r\n\r\n").as_bytes(),
+    );
+    form_body.extend_from_slice(&raw_bytes);
+    form_body.extend_from_slice(format!("\r\n--{bnd}--\r\n").as_bytes());
+    let up_res = req_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ingest/upload?deidentify=true")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={bnd}"),
+                )
+                .body(Body::from(form_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(up_res.status(), StatusCode::OK);
+    let up_json: serde_json::Value =
+        serde_json::from_slice(&up_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let new_uid = up_json["study_uids"][0].as_str().unwrap();
+    assert!(new_uid.starts_with("2.25."));
+    assert_ne!(new_uid, "1.2.826.0.1.3680043.10.5432.8800");
+}
+
+#[tokio::test]
+async fn bearer_auth_cors_allowlist_and_directory_ingest_guard() {
+    let tmp = TempDir::new().unwrap();
+    let store = Arc::new(DicomLanceStore::new(tmp.path()));
+    seed_phantoms_into_store(&store).await.unwrap();
+
+    let app = build_router_with_config(
+        store,
+        None,
+        ServerConfig {
+            api_token: Some("super-secret-token-42".to_string()),
+            cors_origins: vec!["https://viewer.example.org".to_string()],
+            allow_directory_ingest: false,
+            deid: DeidConfig::default(),
+        },
+    );
+
+    // 1. /healthz stays public without auth
+    let health = app
+        .clone()
+        .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    // 2. Protected routes reject missing/invalid token with 401 + WWW-Authenticate
+    for (method, path) in [
+        ("GET", "/api/stats"),
+        ("GET", "/api/search"),
+        ("GET", "/dicomweb/studies"),
+        ("DELETE", "/api/studies/1.2.826.0.1.3680043.10.5432.1001"),
+    ] {
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+        assert_eq!(
+            unauth.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            "Bearer realm=\"dicom-lance\""
+        );
+    }
+
+    let wrong = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats")
+                .header(header::AUTHORIZATION, "Bearer wrong-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Valid bearer token succeeds & reflects security flags
+    let stats_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats")
+                .header(header::AUTHORIZATION, "Bearer super-secret-token-42")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats_res.status(), StatusCode::OK);
+    let stats_json: serde_json::Value =
+        serde_json::from_slice(&stats_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(stats_json["auth_enabled"], true);
+    assert_eq!(stats_json["allow_directory_ingest"], false);
+
+    // 4. Directory ingest blocked with 403 even with valid token when disabled
+    let dir_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ingest/directory")
+                .header(header::AUTHORIZATION, "Bearer super-secret-token-42")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"path":"/tmp"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dir_res.status(), StatusCode::FORBIDDEN);
+
+    // 5. CORS preflight echoes allowlisted origin and omits disallowed origins
+    let allowed_preflight = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/search")
+                .header(header::ORIGIN, "https://viewer.example.org")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(allowed_preflight.status().is_success());
+    assert_eq!(
+        allowed_preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
+        "https://viewer.example.org"
+    );
+
+    let denied_preflight = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/search")
+                .header(header::ORIGIN, "https://evil.attacker.invalid")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(denied_preflight
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .is_none());
+}
+
+#[tokio::test]
+async fn delete_study_and_lance_compact_cleanup_lifecycle() {
+    let tmp = TempDir::new().unwrap();
+    let store = Arc::new(DicomLanceStore::new(tmp.path()));
+    let app = build_router(store.clone(), None);
+
+    seed_phantoms_into_store(&store).await.unwrap();
+
+    // 1. Delete Chest CT study (3 series: CT + SR + SEG, 80 frames)
+    let del_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/studies/{CT_STUDY_UID}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del_res.status(), StatusCode::OK);
+    let del_json: serde_json::Value =
+        serde_json::from_slice(&del_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(del_json["study_instance_uid"], CT_STUDY_UID);
+    assert_eq!(del_json["series_deleted"], 3);
+    assert_eq!(del_json["frames_deleted"], CT_SLICES + CT_SEG_FRAMES);
+
+    // Repeat delete returns 404 Not Found
+    let repeat_del = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/studies/{CT_STUDY_UID}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeat_del.status(), StatusCode::NOT_FOUND);
+
+    // Deleted study is absent from hybrid/FTS search immediately
+    let sp_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/search?q=spiculated&mode=hybrid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sp_res.status(), StatusCode::OK);
+    let sp_json: serde_json::Value =
+        serde_json::from_slice(&sp_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(sp_json["studies"].as_array().unwrap().len(), 0);
+
+    // 2. Compact deleted fragments and prune old Lance versions + Blob V2 data files
+    let compact_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/maintenance/compact")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"retain_versions":1,"delete_unverified":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(compact_res.status(), StatusCode::OK);
+    let compact_json: serde_json::Value =
+        serde_json::from_slice(&compact_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(compact_json["series"]["row_count"], 1);
+    assert_eq!(compact_json["frames"]["row_count"], MR_SLICES);
+    assert!(compact_json["series"]["old_versions_removed"].as_u64().unwrap() > 0);
+    assert!(compact_json["frames"]["old_versions_removed"].as_u64().unwrap() > 0);
+    assert!(compact_json["series"]["fragment_count"].as_u64().unwrap() <= 1);
+    assert!(compact_json["frames"]["fragment_count"].as_u64().unwrap() <= 1);
+
+    // 3. Remaining MR study + Blob V2 Packed reads + Range + Hybrid search still work post-compaction
+    let stats_res = app
+        .clone()
+        .oneshot(Request::builder().uri("/api/stats").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stats_res.status(), StatusCode::OK);
+    let stats_json: serde_json::Value =
+        serde_json::from_slice(&stats_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(stats_json["frames_dataset"]["storage_version"], "2.2");
+    assert_eq!(stats_json["blob_v2_kind_sample"], "Packed");
+
+    let mr_search = store
+        .search_series_with_mode(Some("ring-enhancing"), None, None, 10, SearchMode::Hybrid)
+        .await
+        .unwrap();
+    assert_eq!(mr_search.len(), 1);
+    assert_eq!(mr_search[0].study_instance_uid, MR_STUDY_UID);
+    let mr_ser = &mr_search[0].series[0].series_instance_uid;
+
+    let mr_manifest = store
+        .get_series_frame_descriptors(MR_STUDY_UID, mr_ser)
+        .await
+        .unwrap();
+    assert_eq!(mr_manifest.len(), MR_SLICES);
+    let first_sop = &mr_manifest[0].sop_instance_uid;
+    let range_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{MR_STUDY_UID}/series/{mr_ser}/instances/{first_sop}/frames/1"
+                ))
+                .header(header::RANGE, "bytes=0-63")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(range_res.status(), StatusCode::OK);
+    let range_part = extract_multipart_part(
+        &range_res.into_body().collect().await.unwrap().to_bytes(),
+        "dicom-lance-boundary",
+    );
+    assert_eq!(range_part.len(), 64);
+
+    // 4. Deleting the last study and compacting 0-row tables succeeds cleanly
+    let del_last = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/studies/{MR_STUDY_UID}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del_last.status(), StatusCode::OK);
+
+    let compact_empty = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/maintenance/compact")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(compact_empty.status(), StatusCode::OK);
+    let empty_json: serde_json::Value =
+        serde_json::from_slice(&compact_empty.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(empty_json["series"]["row_count"], 0);
+    assert_eq!(empty_json["frames"]["row_count"], 0);
 }

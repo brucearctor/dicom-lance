@@ -9,6 +9,8 @@ use arrow_array::types::{Float32Type, Float64Type, Int32Type, UInt64Type};
 use arrow_array::{Array, Float32Array, RecordBatch, RecordBatchIterator};
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::cleanup::CleanupPolicyBuilder;
+use lance::dataset::optimize::{compact_files, CompactionOptions};
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 use lance::index::vector::VectorIndexParams;
 use lance::index::DatasetIndexExt;
@@ -319,6 +321,53 @@ pub struct IngestReport {
     pub study_uids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteStudyReport {
+    pub study_instance_uid: String,
+    pub series_deleted: u64,
+    pub frames_deleted: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceOptions {
+    pub retain_versions: usize,
+    pub delete_unverified: bool,
+    pub materialize_deletions_threshold: f32,
+}
+
+impl Default for MaintenanceOptions {
+    fn default() -> Self {
+        Self {
+            retain_versions: 1,
+            delete_unverified: false,
+            materialize_deletions_threshold: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetMaintenanceStats {
+    pub exists: bool,
+    pub version: u64,
+    pub row_count: usize,
+    pub fragment_count: usize,
+    pub fragments_removed: usize,
+    pub fragments_added: usize,
+    pub files_removed: usize,
+    pub files_added: usize,
+    pub old_versions_removed: u64,
+    pub bytes_removed: u64,
+    pub data_files_removed: u64,
+    pub deletion_files_removed: u64,
+    pub index_files_removed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceReport {
+    pub series: DatasetMaintenanceStats,
+    pub frames: DatasetMaintenanceStats,
+}
+
 pub fn validate_sql_literal(value: &str, field: &str) -> Result<String, StoreError> {
     if value.is_empty()
         || value.len() > 128
@@ -563,49 +612,7 @@ impl DicomLanceStore {
                 &["study_instance_uid", "series_instance_uid"],
             )
             .await?;
-
-        series_ds
-            .create_index(
-                &["searchable_text"],
-                IndexType::Inverted,
-                Some(FTS_INDEX_NAME.to_string()),
-                &InvertedIndexParams::default().with_position(true),
-                true,
-            )
-            .await?;
-        series_ds
-            .create_index(
-                &["study_instance_uid"],
-                IndexType::BTree,
-                Some("series_study_uid_btree".to_string()),
-                &ScalarIndexParams::default(),
-                true,
-            )
-            .await?;
-        series_ds
-            .create_index(
-                &["modality"],
-                IndexType::BTree,
-                Some("series_modality_btree".to_string()),
-                &ScalarIndexParams::default(),
-                true,
-            )
-            .await?;
-
-        let series_rows = series_ds.count_rows(None).await?;
-        if series_rows >= IVF_MIN_ROWS {
-            let partitions = (series_rows / 64).clamp(1, 32);
-            let vec_params = VectorIndexParams::ivf_flat(partitions, MetricType::Cosine);
-            series_ds
-                .create_index(
-                    &["series_embedding"],
-                    IndexType::Vector,
-                    Some(SERIES_VEC_INDEX_NAME.to_string()),
-                    &vec_params,
-                    true,
-                )
-                .await?;
-        }
+        Self::ensure_series_indexes(&mut series_ds).await?;
         *self.series_cache.write().await = Some(Arc::new(series_ds));
 
         if let Some(batch) = frames_batch {
@@ -621,49 +628,7 @@ impl DicomLanceStore {
                     ],
                 )
                 .await?;
-
-            frames_ds
-                .create_index(
-                    &["study_instance_uid"],
-                    IndexType::BTree,
-                    Some("frames_study_uid_btree".to_string()),
-                    &ScalarIndexParams::default(),
-                    true,
-                )
-                .await?;
-            frames_ds
-                .create_index(
-                    &["series_instance_uid"],
-                    IndexType::BTree,
-                    Some("frames_series_uid_btree".to_string()),
-                    &ScalarIndexParams::default(),
-                    true,
-                )
-                .await?;
-            frames_ds
-                .create_index(
-                    &["sop_instance_uid"],
-                    IndexType::BTree,
-                    Some("frames_sop_uid_btree".to_string()),
-                    &ScalarIndexParams::default(),
-                    true,
-                )
-                .await?;
-
-            let frame_rows = frames_ds.count_rows(None).await?;
-            if frame_rows >= IVF_MIN_ROWS {
-                let partitions = (frame_rows / 64).clamp(4, 64);
-                let vec_params = VectorIndexParams::ivf_flat(partitions, MetricType::Cosine);
-                frames_ds
-                    .create_index(
-                        &["frame_embedding"],
-                        IndexType::Vector,
-                        Some(FRAMES_VEC_INDEX_NAME.to_string()),
-                        &vec_params,
-                        true,
-                    )
-                    .await?;
-            }
+            Self::ensure_frames_indexes(&mut frames_ds).await?;
             *self.frames_cache.write().await = Some(Arc::new(frames_ds));
         }
 
@@ -1608,6 +1573,225 @@ impl DicomLanceStore {
             series_dataset,
             frames_dataset,
         })
+    }
+
+    async fn ensure_series_indexes(series_ds: &mut Dataset) -> Result<(), StoreError> {
+        let series_rows = series_ds.count_rows(None).await?;
+        if series_rows == 0 {
+            return Ok(());
+        }
+
+        series_ds
+            .create_index(
+                &["searchable_text"],
+                IndexType::Inverted,
+                Some(FTS_INDEX_NAME.to_string()),
+                &InvertedIndexParams::default().with_position(true),
+                true,
+            )
+            .await?;
+        series_ds
+            .create_index(
+                &["study_instance_uid"],
+                IndexType::BTree,
+                Some("series_study_uid_btree".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await?;
+        series_ds
+            .create_index(
+                &["modality"],
+                IndexType::BTree,
+                Some("series_modality_btree".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await?;
+
+        if series_rows >= IVF_MIN_ROWS {
+            let partitions = (series_rows / 64).clamp(1, 32);
+            let vec_params = VectorIndexParams::ivf_flat(partitions, MetricType::Cosine);
+            series_ds
+                .create_index(
+                    &["series_embedding"],
+                    IndexType::Vector,
+                    Some(SERIES_VEC_INDEX_NAME.to_string()),
+                    &vec_params,
+                    true,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_frames_indexes(frames_ds: &mut Dataset) -> Result<(), StoreError> {
+        let frame_rows = frames_ds.count_rows(None).await?;
+        if frame_rows == 0 {
+            return Ok(());
+        }
+
+        frames_ds
+            .create_index(
+                &["study_instance_uid"],
+                IndexType::BTree,
+                Some("frames_study_uid_btree".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await?;
+        frames_ds
+            .create_index(
+                &["series_instance_uid"],
+                IndexType::BTree,
+                Some("frames_series_uid_btree".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await?;
+        frames_ds
+            .create_index(
+                &["sop_instance_uid"],
+                IndexType::BTree,
+                Some("frames_sop_uid_btree".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await?;
+
+        if frame_rows >= IVF_MIN_ROWS {
+            let partitions = (frame_rows / 64).clamp(4, 64);
+            let vec_params = VectorIndexParams::ivf_flat(partitions, MetricType::Cosine);
+            frames_ds
+                .create_index(
+                    &["frame_embedding"],
+                    IndexType::Vector,
+                    Some(FRAMES_VEC_INDEX_NAME.to_string()),
+                    &vec_params,
+                    true,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Deletes all series and frame rows belonging to a study across both Lance datasets.
+    pub async fn delete_study(&self, study_uid: &str) -> Result<DeleteStudyReport, StoreError> {
+        let safe_study = validate_sql_literal(study_uid, "study_instance_uid")?;
+        let predicate = format!("study_instance_uid = '{safe_study}'");
+
+        let _guard = self.write_lock.lock().await;
+
+        let Some(mut series_ds) = self.open_opt(&self.series_uri()).await? else {
+            return Err(StoreError::NotFound(format!(
+                "study not found: {safe_study}"
+            )));
+        };
+
+        let series_del = series_ds.delete(&predicate).await?;
+        if series_del.num_deleted_rows == 0 {
+            return Err(StoreError::NotFound(format!(
+                "study not found: {safe_study}"
+            )));
+        }
+        *self.series_cache.write().await = Some(Arc::new(series_ds));
+
+        let mut frames_deleted = 0;
+        if let Some(mut frames_ds) = self.open_opt(&self.frames_uri()).await? {
+            let frames_del = frames_ds.delete(&predicate).await?;
+            frames_deleted = frames_del.num_deleted_rows;
+            *self.frames_cache.write().await = Some(Arc::new(frames_ds));
+        }
+
+        Ok(DeleteStudyReport {
+            study_instance_uid: safe_study,
+            series_deleted: series_del.num_deleted_rows,
+            frames_deleted,
+        })
+    }
+
+    async fn maintain_dataset(
+        &self,
+        uri: &str,
+        cache: &RwLock<Option<Arc<Dataset>>>,
+        is_series: bool,
+        opts: &MaintenanceOptions,
+    ) -> Result<DatasetMaintenanceStats, StoreError> {
+        let Some(mut ds) = self.open_opt(uri).await? else {
+            return Ok(DatasetMaintenanceStats {
+                exists: false,
+                version: 0,
+                row_count: 0,
+                fragment_count: 0,
+                fragments_removed: 0,
+                fragments_added: 0,
+                files_removed: 0,
+                files_added: 0,
+                old_versions_removed: 0,
+                bytes_removed: 0,
+                data_files_removed: 0,
+                deletion_files_removed: 0,
+                index_files_removed: 0,
+            });
+        };
+
+        let compact_opts = CompactionOptions {
+            materialize_deletions: true,
+            materialize_deletions_threshold: opts.materialize_deletions_threshold.clamp(0.0, 1.0),
+            ..CompactionOptions::default()
+        };
+        let compaction = compact_files(&mut ds, compact_opts, None).await?;
+        if compaction.fragments_removed > 0 {
+            if is_series {
+                Self::ensure_series_indexes(&mut ds).await?;
+            } else {
+                Self::ensure_frames_indexes(&mut ds).await?;
+            }
+        }
+
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&ds, opts.retain_versions.max(1))
+            .await?
+            .delete_unverified(opts.delete_unverified)
+            .error_if_tagged_old_versions(false)
+            .build();
+        let cleanup = ds.cleanup_with_policy(policy).await?;
+
+        let version = ds.version().version;
+        let row_count = ds.count_rows(None).await?;
+        let fragment_count = ds.get_fragments().len();
+        *cache.write().await = Some(Arc::new(ds));
+
+        Ok(DatasetMaintenanceStats {
+            exists: true,
+            version,
+            row_count,
+            fragment_count,
+            fragments_removed: compaction.fragments_removed,
+            fragments_added: compaction.fragments_added,
+            files_removed: compaction.files_removed,
+            files_added: compaction.files_added,
+            old_versions_removed: cleanup.old_versions,
+            bytes_removed: cleanup.bytes_removed,
+            data_files_removed: cleanup.data_files_removed,
+            deletion_files_removed: cleanup.deletion_files_removed,
+            index_files_removed: cleanup.index_files_removed,
+        })
+    }
+
+    /// Compacts deleted/fragmented Lance files and prunes old versions/unreferenced Blob V2 files.
+    pub async fn compact_and_cleanup(
+        &self,
+        opts: &MaintenanceOptions,
+    ) -> Result<MaintenanceReport, StoreError> {
+        let _guard = self.write_lock.lock().await;
+        let series = self
+            .maintain_dataset(&self.series_uri(), &self.series_cache, true, opts)
+            .await?;
+        let frames = self
+            .maintain_dataset(&self.frames_uri(), &self.frames_cache, false, opts)
+            .await?;
+        Ok(MaintenanceReport { series, frames })
     }
 }
 
