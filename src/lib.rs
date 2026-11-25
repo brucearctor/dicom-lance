@@ -6,4 +6,5 @@ pub mod embedding;
 pub mod phantom;
 pub mod schema;
 pub mod seg;
+pub mod sr;
 pub mod store;

@@ -1,3 +1,5 @@
+import { wrapDicomInMultipartRelated } from '../cornerstone/measurements';
+
 export interface SeriesSummary {
   study_instance_uid: string;
   series_instance_uid: string;
@@ -151,6 +153,38 @@ export interface DatasetMaintenanceStats {
 export interface MaintenanceReport {
   series: DatasetMaintenanceStats;
   frames: DatasetMaintenanceStats;
+}
+
+export interface MeasurementSrInput {
+  tool: 'Length' | 'Bidirectional' | 'EllipticalROI';
+  label: string;
+  sop_instance_uid: string | null;
+  frame_number: number | null;
+  slice_z_mm: number | null;
+  length_mm: number | null;
+  width_mm: number | null;
+  area_mm2: number | null;
+  mean_hu: number | null;
+  std_dev_hu: number | null;
+  unit: string | null;
+  points_world: [number, number, number][];
+}
+
+export interface MeasurementSrRequest {
+  series_description?: string;
+  findings_note?: string;
+  measurements: MeasurementSrInput[];
+  deidentify?: boolean;
+}
+
+export interface MeasurementSrResponse {
+  study_instance_uid: string;
+  series_instance_uid: string;
+  sop_instance_uid: string;
+  sr_text: string;
+  series_ingested: number;
+  frames_ingested: number;
+  study_uids: string[];
 }
 
 export class ApiUnauthorizedError extends Error {
@@ -390,4 +424,96 @@ export async function fetchSeriesSegmentations(
   }
   const data = (await res.json()) as { segmentations?: SegmentationMetadata[] };
   return data.segmentations ?? [];
+}
+
+export async function createMeasurementSrDicom(
+  studyUid: string,
+  seriesUid: string,
+  req: MeasurementSrRequest,
+): Promise<Uint8Array> {
+  const res = await apiFetch(
+    `/api/studies/${encodeURIComponent(studyUid)}/series/${encodeURIComponent(seriesUid)}/measurements/sr`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/dicom',
+      },
+      body: JSON.stringify(req),
+    },
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`SR serialization failed (${res.status}): ${body}`);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+export async function createMeasurementSrDirect(
+  studyUid: string,
+  seriesUid: string,
+  req: MeasurementSrRequest,
+): Promise<MeasurementSrResponse> {
+  const res = await apiFetch(
+    `/api/studies/${encodeURIComponent(studyUid)}/series/${encodeURIComponent(seriesUid)}/measurements/sr`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(req),
+    },
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`SR creation failed (${res.status}): ${body}`);
+  }
+  return (await res.json()) as MeasurementSrResponse;
+}
+
+export async function stowDicomParts(parts: Uint8Array[]): Promise<IngestReport> {
+  if (parts.length === 0) {
+    throw new Error('STOW-RS requires at least one DICOM object');
+  }
+  const boundary = `dicom-lance-stow-${Date.now()}`;
+  const body =
+    parts.length === 1
+      ? wrapDicomInMultipartRelated(parts[0], boundary)
+      : (() => {
+          const enc = new TextEncoder();
+          const chunks: Uint8Array[] = [];
+          let total = 0;
+          for (const part of parts) {
+            const hdr = enc.encode(
+              `--${boundary}\r\nContent-Type: application/dicom\r\nContent-Length: ${part.byteLength}\r\n\r\n`,
+            );
+            const crlf = enc.encode('\r\n');
+            chunks.push(hdr, part, crlf);
+            total += hdr.byteLength + part.byteLength + crlf.byteLength;
+          }
+          const end = enc.encode(`--${boundary}--\r\n`);
+          chunks.push(end);
+          total += end.byteLength;
+          const merged = new Uint8Array(total);
+          let off = 0;
+          for (const c of chunks) {
+            merged.set(c, off);
+            off += c.byteLength;
+          }
+          return merged;
+        })();
+
+  const res = await apiFetch('/dicomweb/studies', {
+    method: 'POST',
+    headers: {
+      'Content-Type': `multipart/related; type="application/dicom"; boundary="${boundary}"`,
+    },
+    body: body as unknown as BodyInit,
+  });
+  if (!res.ok) {
+    const msg = await res.text();
+    throw new Error(`STOW-RS failed (${res.status}): ${msg}`);
+  }
+  return (await res.json()) as IngestReport;
 }

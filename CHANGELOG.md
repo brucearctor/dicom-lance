@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- **Interactive SEG Controls & 3D MPR SEG Overlays (`web/src/cornerstone/`)**:
+  - Added per-segment visibility toggles (`aria-pressed`), a `10%–100%` overlay opacity slider, and **"Center SEG"** camera alignment.
+  - Enabled **SEG Overlay** in **3D MPR** across Axial, Sagittal, and Coronal WebGL viewports via an affine tight-bbox 3D mask reslicer (`buildSegVolumeLayers`, `resliceSegVolumesToCanvasRgba`).
+- **Measurement -> DICOM SR (`TID 1500`) Round-Trip (`src/sr.rs`, `src/api.rs`, `web/src/cornerstone/measurements.ts`)**:
+  - Added `POST /api/studies/{study}/series/{series}/measurements/sr` supporting both `Accept: application/dicom` (Part-10 `ComprehensiveSRStorage` bytes for client `STOW-RS` upload to `/dicomweb/studies`) and `Accept: application/json` (direct server-side ingest inheriting stored de-identified pseudonyms).
+  - Added **Measurements** drawer in the viewer (`Length`, `Bidirectional` RECIST, `EllipticalROI`) with editable labels, clinician findings notes, and one-click `Save DICOM SR (STOW-RS)` persistence indexed immediately into Hybrid BM25 + Vector search.
 - **DICOM PS3.15 De-identification (`src/deid.rs`, `src/dicom_ingest.rs`)**:
   - Added deterministic salted SHA-256 DICOM PS3.15 Basic Profile de-identification across file meta and nested sequences (`CT`/`SR`/`SEG` cross-references stay aligned via consistent Study/Series/SOP/FrameOfReference UID remapping while private tags, direct PHI, observer sequences, and sub-study timestamps are stripped or generalized).
   - Configurable globally via `--deidentify` / `DEIDENTIFY=true` and `--deidentify-salt` / `DEIDENTIFY_SALT`, or per ingest request via `?deidentify=true` on `/api/ingest/upload`, `/dicomweb/studies` (STOW-RS), and `/api/ingest/seed-phantoms` (`deidentify: true` on `/api/ingest/directory`).

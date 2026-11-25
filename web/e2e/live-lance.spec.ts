@@ -88,7 +88,17 @@ test.describe('Live Rust + Lance v2.2 + Cornerstone3D WebGL2 E2E', () => {
     const segOverlayCanvas = page.getByTestId('seg-overlay-canvas');
     await expect(segOverlayCanvas).toBeVisible();
     await expect(page.getByText('RUL Nodule Solid Core')).toBeVisible();
-    await expect(page.getByText('Ground-Glass Halo')).toBeVisible();
+    const haloToggle = page.getByRole('button', { name: /Ground-Glass Halo/i });
+    await expect(haloToggle).toBeVisible();
+    await expect(haloToggle).toHaveAttribute('aria-pressed', 'true');
+    await haloToggle.click();
+    await expect(haloToggle).toHaveAttribute('aria-pressed', 'false');
+    await haloToggle.click();
+    await expect(haloToggle).toHaveAttribute('aria-pressed', 'true');
+
+    const opacitySlider = page.locator('#seg-opacity-slider');
+    await opacitySlider.fill('75');
+    await expect(page.getByText('75%')).toBeVisible();
 
     await expect
       .poll(
@@ -100,9 +110,36 @@ test.describe('Live Rust + Lance v2.2 + Cornerstone3D WebGL2 E2E', () => {
       )
       .toBeGreaterThan(10);
 
-    // Toggle SEG Overlay off before verifying 3-up 3D MPR
+    // Toggle SEG Overlay off while drawing a Length measurement & persisting DICOM SR (TID 1500) via STOW-RS
     await segBtn.click();
     await expect(segOverlayCanvas).toBeHidden();
+
+    await page.getByRole('button', { name: 'Length', exact: true }).click();
+    const stackVp = page.getByLabel('2D Stack Viewport');
+    const vpBox = await stackVp.boundingBox();
+    expect(vpBox).not.toBeNull();
+    if (vpBox) {
+      await page.mouse.move(vpBox.x + vpBox.width * 0.36, vpBox.y + vpBox.height * 0.46);
+      await page.mouse.down();
+      await page.mouse.move(vpBox.x + vpBox.width * 0.56, vpBox.y + vpBox.height * 0.46, {
+        steps: 10,
+      });
+      await page.mouse.up();
+    }
+
+    const measPanel = page.getByRole('complementary', { name: 'Measurements' });
+    if (!(await measPanel.isVisible())) {
+      await page.getByRole('button', { name: /Measurements/i }).click();
+    }
+    await expect(measPanel.locator('.measurement-card')).toHaveCount(1, { timeout: 10_000 });
+    await page.locator('#sr-findings-note').fill('Live E2E RUL spiculated nodule measurement');
+    await measPanel.getByRole('button', { name: /Save DICOM SR \(STOW-RS\)/i }).click();
+    await expect(page.getByText('[SR] Viewer Measurement Report (TID 1500)')).toBeVisible({
+      timeout: 15_000,
+    });
+    await measPanel.getByRole('button', { name: 'Close' }).click();
+    await expect(measPanel).toBeHidden();
+    await page.getByRole('button', { name: 'W/L', exact: true }).click();
 
     // 2b. Find Similar Slices via live 768-d Lance cosine KNN and click-to-jump
     const similarBtn = page.getByRole('button', { name: 'Similar Slices' });
@@ -117,7 +154,7 @@ test.describe('Live Rust + Lance v2.2 + Cornerstone3D WebGL2 E2E', () => {
     await similarPanel.getByRole('button', { name: 'Close' }).click();
     await expect(similarPanel).toBeHidden();
 
-    // 3. Apply Window/Level preset and verify live MPR 3-Up (Axial / Sagittal / Coronal)
+    // 3. Apply Window/Level preset and verify live MPR 3-Up (Axial / Sagittal / Coronal) + 3D SEG Overlay
     await page.getByRole('button', { name: 'Bone (300/1500)' }).click();
     await page.getByRole('button', { name: '3D MPR' }).click();
 
@@ -128,6 +165,30 @@ test.describe('Live Rust + Lance v2.2 + Cornerstone3D WebGL2 E2E', () => {
           return stats.length === 3 && stats.every((c) => c.nonBlack > 150);
         },
         { timeout: 30_000 },
+      )
+      .toBe(true);
+
+    await segBtn.click();
+    await expect(page.getByTestId('mpr-seg-overlay-axial')).toBeVisible();
+    await expect(page.getByTestId('mpr-seg-overlay-sagittal')).toBeVisible();
+    await expect(page.getByTestId('mpr-seg-overlay-coronal')).toBeVisible();
+    await page.getByRole('button', { name: 'Center SEG' }).click();
+
+    await expect
+      .poll(
+        async () => {
+          const stats = await sampleCanvasStats(page);
+          return (
+            stats.length === 6 &&
+            stats[0].nonBlack > 150 &&
+            stats[2].nonBlack > 150 &&
+            stats[4].nonBlack > 150 &&
+            stats[1].nonBlack > 5 &&
+            stats[3].nonBlack > 5 &&
+            stats[5].nonBlack > 5
+          );
+        },
+        { timeout: 20_000 },
       )
       .toBe(true);
 

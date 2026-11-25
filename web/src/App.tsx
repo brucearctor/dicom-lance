@@ -586,6 +586,8 @@ export function App() {
             onNavigateToSlice={handleNavigateToSlice}
             requestedSliceIndex={pendingSliceIndex}
             onConsumedRequestedSlice={() => setPendingSliceIndex(null)}
+            deidentifyEnabled={Boolean(stats?.deidentify_enabled)}
+            onCatalogUpdated={() => refreshData(query, modality, searchMode)}
           />
         </main>
       </div>

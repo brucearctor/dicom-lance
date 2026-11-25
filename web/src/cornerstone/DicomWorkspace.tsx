@@ -1,12 +1,14 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   Enums,
+  eventTarget,
   RenderingEngine,
   setVolumesForViewports,
   type Types,
   volumeLoader,
 } from '@cornerstonejs/core';
 import {
+  annotation,
   BidirectionalTool,
   CrosshairsTool,
   EllipticalROITool,
@@ -20,6 +22,8 @@ import {
 } from '@cornerstonejs/tools';
 import {
   computeVoiRange,
+  createMeasurementSrDicom,
+  createMeasurementSrDirect,
   fetchFramesManifest,
   fetchSeriesMetadata,
   fetchSeriesSegmentations,
@@ -29,13 +33,22 @@ import {
   type SegmentationMetadata,
   type SeriesSummary,
   type SimilarFrameHit,
+  stowDicomParts,
   WINDOW_PRESETS,
 } from '../api/client';
 import { initCornerstoneOnce, prepareSeriesImageIds, type ToolMode } from './init';
 import {
+  collectMeasurementsForSeries,
+  formatMeasurementSummary,
+  type SerializedMeasurement,
+} from './measurements';
+import {
+  buildSegVolumeLayers,
   compositeSegMasksRgba,
   extractMultipartFirstPart,
   findMatchingSegFrames,
+  resliceSegVolumesToCanvasRgba,
+  type SegSegmentVolume,
 } from './segOverlay';
 
 interface DicomWorkspaceProps {
@@ -45,6 +58,8 @@ interface DicomWorkspaceProps {
   onNavigateToSlice?: (seriesUid: string, sliceSortIndex: number) => void;
   requestedSliceIndex?: number | null;
   onConsumedRequestedSlice?: () => void;
+  deidentifyEnabled?: boolean;
+  onCatalogUpdated?: () => Promise<void> | void;
 }
 
 type ViewMode = 'stack' | 'mpr';
@@ -94,6 +109,9 @@ function applyActiveTool(toolGroupId: string, active: ToolMode, mode: ViewMode):
   }
 }
 
+const EMPTY_FRAMES: FrameDescriptor[] = [];
+const EMPTY_SEGMENTATIONS: SegmentationMetadata[] = [];
+
 export function DicomWorkspace({
   series,
   siblingSeries,
@@ -101,6 +119,8 @@ export function DicomWorkspace({
   onNavigateToSlice,
   requestedSliceIndex,
   onConsumedRequestedSlice,
+  deidentifyEnabled = false,
+  onCatalogUpdated,
 }: DicomWorkspaceProps) {
   const rawUid = useId().replace(/:/g, '_');
   const engineId = `lance_engine_${rawUid}`;
@@ -110,7 +130,21 @@ export function DicomWorkspace({
   const [toolMode, setToolMode] = useState<ToolMode>('WindowLevel');
   const [presetId, setPresetId] = useState<string>('auto');
   const [mipEnabled, setMipEnabled] = useState<boolean>(false);
-  const [frames, setFrames] = useState<FrameDescriptor[]>([]);
+  const [seriesData, setSeriesData] = useState<{
+    seriesUid: string | null;
+    frames: FrameDescriptor[];
+    segmentations: SegmentationMetadata[];
+  }>({
+    seriesUid: null,
+    frames: EMPTY_FRAMES,
+    segmentations: EMPTY_SEGMENTATIONS,
+  });
+  const isSeriesDataCurrent =
+    Boolean(series) && seriesData.seriesUid === series!.series_instance_uid;
+  const frames = isSeriesDataCurrent ? seriesData.frames : EMPTY_FRAMES;
+  const segmentations = isSeriesDataCurrent
+    ? seriesData.segmentations
+    : EMPTY_SEGMENTATIONS;
   const [sliceIndex, setSliceIndex] = useState<number>(0);
   const [loadStatus, setLoadStatus] = useState<string>('Select a series to load');
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -118,8 +152,17 @@ export function DicomWorkspace({
   const [similarLoading, setSimilarLoading] = useState<boolean>(false);
   const [similarError, setSimilarError] = useState<string | null>(null);
   const [similarHits, setSimilarHits] = useState<SimilarFrameHit[]>([]);
-  const [segmentations, setSegmentations] = useState<SegmentationMetadata[]>([]);
   const [segOverlayEnabled, setSegOverlayEnabled] = useState<boolean>(false);
+  const [hiddenSegments, setHiddenSegments] = useState<Record<number, boolean>>({});
+  const [segOpacity, setSegOpacity] = useState<number>(0.65);
+  const [mprSegRevision, setMprSegRevision] = useState<number>(0);
+
+  const [showMeasurements, setShowMeasurements] = useState<boolean>(false);
+  const [measurements, setMeasurements] = useState<SerializedMeasurement[]>([]);
+  const [measurementLabels, setMeasurementLabels] = useState<Record<string, string>>({});
+  const [findingsNote, setFindingsNote] = useState<string>('');
+  const [savingSr, setSavingSr] = useState<boolean>(false);
+  const [srSaveStatus, setSrSaveStatus] = useState<string | null>(null);
 
   const stackElRef = useRef<HTMLDivElement | null>(null);
   const segCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -127,6 +170,10 @@ export function DicomWorkspace({
   const axialElRef = useRef<HTMLDivElement | null>(null);
   const sagittalElRef = useRef<HTMLDivElement | null>(null);
   const coronalElRef = useRef<HTMLDivElement | null>(null);
+  const mprSegAxialCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const mprSegSagittalCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const mprSegCoronalCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const mprSegVolumesRef = useRef<SegSegmentVolume[]>([]);
   const engineRef = useRef<RenderingEngine | null>(null);
   const viewportIdsRef = useRef<string[]>([]);
   const imageIdsRef = useRef<string[]>([]);
@@ -139,14 +186,25 @@ export function DicomWorkspace({
       }
     }
     setPresetId('auto');
-    setFrames([]);
+    setSeriesData({
+      seriesUid: null,
+      frames: EMPTY_FRAMES,
+      segmentations: EMPTY_SEGMENTATIONS,
+    });
     setSliceIndex(0);
     setShowSimilar(false);
     setSimilarHits([]);
     setSimilarError(null);
-    setSegmentations([]);
     setSegOverlayEnabled(false);
+    setHiddenSegments({});
+    setMprSegRevision(0);
+    mprSegVolumesRef.current = [];
     segMaskCacheRef.current.clear();
+    setShowMeasurements(false);
+    setMeasurements([]);
+    setMeasurementLabels({});
+    setFindingsNote('');
+    setSrSaveStatus(null);
   }, [series?.series_instance_uid]);
 
   useEffect(() => {
@@ -188,8 +246,11 @@ export function DicomWorkspace({
 
         if (cancelled) return;
 
-        setFrames(manifest);
-        setSegmentations(segList);
+        setSeriesData({
+          seriesUid: activeSeries.series_instance_uid,
+          frames: manifest,
+          segmentations: segList,
+        });
         const imageIds = prepareSeriesImageIds(
           window.location.origin,
           activeSeries.study_instance_uid,
@@ -416,10 +477,65 @@ export function DicomWorkspace({
     () => findMatchingSegFrames(segmentations, activeFrame),
     [segmentations, activeFrame],
   );
-  const segLegendSegments = useMemo(
-    () => segmentations.flatMap((s) => s.segments),
-    [segmentations],
+  const visibleMatchedSegLayers = useMemo(
+    () => matchedSegLayers.filter((layer) => !hiddenSegments[layer.segment.segment_number]),
+    [matchedSegLayers, hiddenSegments],
   );
+  const segLegendSegments = useMemo(() => {
+    const byNum = new Map<number, (typeof segmentations)[number]['segments'][number]>();
+    for (const seg of segmentations) {
+      for (const desc of seg.segments) {
+        if (!byNum.has(desc.segment_number)) {
+          byNum.set(desc.segment_number, desc);
+        }
+      }
+    }
+    return Array.from(byNum.values()).sort((a, b) => a.segment_number - b.segment_number);
+  }, [segmentations]);
+
+  const toggleSegmentVisibility = useCallback((segmentNumber: number) => {
+    setHiddenSegments((prev) => ({
+      ...prev,
+      [segmentNumber]: !prev[segmentNumber],
+    }));
+  }, []);
+
+  const centerMprCamerasOnSeg = useCallback(() => {
+    if (!engineRef.current || viewportIdsRef.current.length === 0) return;
+    const volumes = mprSegVolumesRef.current;
+    const targetVol =
+      volumes.find((v) => !hiddenSegments[v.segmentNumber] && v.centroidIjk !== null) ??
+      volumes.find((v) => v.centroidIjk !== null);
+    if (!targetVol || !targetVol.centroidIjk) return;
+
+    const firstVp = engineRef.current.getViewport(viewportIdsRef.current[0]) as
+      | Types.IVolumeViewport
+      | undefined;
+    const imgDataObj = firstVp?.getImageData()?.imageData as
+      | { indexToWorld?: (ijk: [number, number, number]) => [number, number, number] }
+      | undefined;
+    if (!imgDataObj?.indexToWorld) return;
+
+    const worldCenter = imgDataObj.indexToWorld(targetVol.centroidIjk);
+    if (!worldCenter.every((c) => Number.isFinite(c))) return;
+
+    for (const vpId of viewportIdsRef.current) {
+      const vp = engineRef.current.getViewport(vpId) as Types.IVolumeViewport | undefined;
+      if (!vp) continue;
+      const cam = vp.getCamera();
+      const oldFocal = cam.focalPoint ?? [0, 0, 0];
+      const oldPos = cam.position ?? [0, 0, 1];
+      const dx = worldCenter[0] - oldFocal[0];
+      const dy = worldCenter[1] - oldFocal[1];
+      const dz = worldCenter[2] - oldFocal[2];
+      vp.setCamera({
+        ...cam,
+        focalPoint: worldCenter,
+        position: [oldPos[0] + dx, oldPos[1] + dy, oldPos[2] + dz],
+      });
+      vp.render();
+    }
+  }, [hiddenSegments]);
 
   useEffect(() => {
     if (!segOverlayEnabled || viewMode !== 'stack' || !series || !activeFrame) {
@@ -515,20 +631,20 @@ export function DicomWorkspace({
     };
 
     const loadAndDraw = async () => {
-      if (matchedSegLayers.length === 0) {
+      if (visibleMatchedSegLayers.length === 0) {
         latestComposite = null;
         drawOverlay();
         return;
       }
 
-      const maskRows = matchedSegLayers[0].seg.rows || series.rows;
-      const maskCols = matchedSegLayers[0].seg.columns || series.columns;
+      const maskRows = visibleMatchedSegLayers[0].seg.rows || series.rows;
+      const maskCols = visibleMatchedSegLayers[0].seg.columns || series.columns;
       const layerInputs: Array<{
         mask: Uint8Array;
         colorRgba: [number, number, number, number];
       }> = [];
 
-      for (const layer of matchedSegLayers) {
+      for (const layer of visibleMatchedSegLayers) {
         const cacheKey = `${layer.seg.seg_series_instance_uid}:${layer.seg.seg_sop_instance_uid}:${layer.mapping.seg_frame_number}`;
         let mask = segMaskCacheRef.current.get(cacheKey);
         if (!mask) {
@@ -552,7 +668,7 @@ export function DicomWorkspace({
         layerInputs.push({ mask, colorRgba: layer.segment.color_rgba });
       }
 
-      const rgba = compositeSegMasksRgba(maskRows, maskCols, layerInputs);
+      const rgba = compositeSegMasksRgba(maskRows, maskCols, layerInputs, segOpacity);
       if (cancelled) return;
       latestComposite = { rgba, rows: maskRows, cols: maskCols };
       drawOverlay();
@@ -587,8 +703,239 @@ export function DicomWorkspace({
     series?.columns,
     sliceIndex,
     activeFrame,
-    matchedSegLayers,
+    visibleMatchedSegLayers,
+    segOpacity,
   ]);
+
+  useEffect(() => {
+    if (
+      !segOverlayEnabled ||
+      viewMode !== 'mpr' ||
+      !series ||
+      frames.length === 0 ||
+      segmentations.length === 0
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const loadMprSegVolumes = async () => {
+      for (const seg of segmentations) {
+        if (seg.referenced_series_uid && seg.referenced_series_uid !== series.series_instance_uid) {
+          continue;
+        }
+        for (const mapping of seg.frames) {
+          const cacheKey = `${seg.seg_series_instance_uid}:${seg.seg_sop_instance_uid}:${mapping.seg_frame_number}`;
+          if (!segMaskCacheRef.current.has(cacheKey)) {
+            const url = `/dicomweb/studies/${series.study_instance_uid}/series/${seg.seg_series_instance_uid}/instances/${seg.seg_sop_instance_uid}/frames/${mapping.seg_frame_number}`;
+            const res = await fetch(url, {
+              headers: {
+                ...getAuthHeaders(),
+                Accept:
+                  'multipart/related; type="application/octet-stream"; transfer-syntax=1.2.840.10008.1.2.1',
+              },
+            });
+            if (!res.ok) {
+              throw new Error(`Failed to load MPR SEG frame: ${res.status}`);
+            }
+            const ct = res.headers.get('content-type') || '';
+            const buf = new Uint8Array(await res.arrayBuffer());
+            const mask = extractMultipartFirstPart(ct, buf);
+            segMaskCacheRef.current.set(cacheKey, mask);
+          }
+          if (cancelled) return;
+        }
+      }
+
+      const volumes = buildSegVolumeLayers(segmentations, frames, segMaskCacheRef.current);
+      if (cancelled) return;
+      mprSegVolumesRef.current = volumes;
+      setMprSegRevision((prev) => prev + 1);
+      centerMprCamerasOnSeg();
+    };
+
+    void loadMprSegVolumes().catch((err) => {
+      if (!cancelled) {
+        setLoadError(err instanceof Error ? err.message : 'Failed to build 3D MPR SEG volume');
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    segOverlayEnabled,
+    viewMode,
+    series?.series_instance_uid,
+    series?.study_instance_uid,
+    frames,
+    segmentations,
+    centerMprCamerasOnSeg,
+  ]);
+
+  useEffect(() => {
+    if (!segOverlayEnabled || viewMode !== 'mpr' || !isSeriesDataCurrent) {
+      return;
+    }
+
+    const panes: Array<{
+      vpId: string;
+      host: HTMLDivElement | null;
+      canvas: HTMLCanvasElement | null;
+    }> = [
+      { vpId: 'MPR_AXIAL', host: axialElRef.current, canvas: mprSegAxialCanvasRef.current },
+      { vpId: 'MPR_SAGITTAL', host: sagittalElRef.current, canvas: mprSegSagittalCanvasRef.current },
+      { vpId: 'MPR_CORONAL', host: coronalElRef.current, canvas: mprSegCoronalCanvasRef.current },
+    ];
+
+    const drawPane = (
+      vpId: string,
+      host: HTMLDivElement | null,
+      segCanvas: HTMLCanvasElement | null,
+    ) => {
+      if (!host || !segCanvas) return;
+      const w = host.clientWidth;
+      const h = host.clientHeight;
+      if (w <= 0 || h <= 0) return;
+
+      if (segCanvas.width !== w || segCanvas.height !== h) {
+        segCanvas.width = w;
+        segCanvas.height = h;
+      }
+      const ctx = segCanvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+
+      const volumes = mprSegVolumesRef.current;
+      if (volumes.length === 0) return;
+
+      const vp = engineRef.current?.getViewport(vpId) as Types.IVolumeViewport | undefined;
+      const imgDataObj = vp?.getImageData()?.imageData as
+        | {
+            indexToWorld?: (ijk: [number, number, number]) => [number, number, number];
+            worldToIndex?: (xyz: [number, number, number]) => [number, number, number];
+          }
+        | undefined;
+      if (!vp || !imgDataObj?.worldToIndex || !imgDataObj?.indexToWorld) return;
+
+      const ijk00 = imgDataObj.worldToIndex(vp.canvasToWorld([0, 0]));
+      const ijk10 = imgDataObj.worldToIndex(vp.canvasToWorld([w, 0]));
+      const ijk01 = imgDataObj.worldToIndex(vp.canvasToWorld([0, h]));
+      if (
+        !ijk00.every(Number.isFinite) ||
+        !ijk10.every(Number.isFinite) ||
+        !ijk01.every(Number.isFinite)
+      ) {
+        return;
+      }
+
+      let minSx = w;
+      let minSy = h;
+      let maxSx = -1;
+      let maxSy = -1;
+      for (const vol of volumes) {
+        if (hiddenSegments[vol.segmentNumber] || !vol.bbox) continue;
+        const [bx0, by0, bz0, bx1, by1, bz1] = vol.bbox;
+        for (const ix of [bx0 - 0.5, bx1 + 0.5]) {
+          for (const iy of [by0 - 0.5, by1 + 0.5]) {
+            for (const iz of [bz0 - 0.5, bz1 + 0.5]) {
+              const pt = vp.worldToCanvas(imgDataObj.indexToWorld([ix, iy, iz]));
+              if (Number.isFinite(pt[0]) && Number.isFinite(pt[1])) {
+                if (pt[0] < minSx) minSx = pt[0];
+                if (pt[0] > maxSx) maxSx = pt[0];
+                if (pt[1] < minSy) minSy = pt[1];
+                if (pt[1] > maxSy) maxSy = pt[1];
+              }
+            }
+          }
+        }
+      }
+      if (maxSx < 0 || maxSy < 0 || minSx > w || minSy > h) {
+        return;
+      }
+
+      const result = resliceSegVolumesToCanvasRgba(
+        w,
+        h,
+        volumes,
+        hiddenSegments,
+        segOpacity,
+        ijk00,
+        ijk10,
+        ijk01,
+        [minSx - 2, minSy - 2, maxSx + 2, maxSy + 2],
+      );
+      if (!result) return;
+
+      const [dx, dy, dw, dh] = result.dirtyRect;
+      const offscreen = document.createElement('canvas');
+      offscreen.width = dw;
+      offscreen.height = dh;
+      const octx = offscreen.getContext('2d');
+      if (!octx) return;
+      octx.putImageData(
+        new ImageData(new Uint8ClampedArray(result.rgba), dw, dh),
+        0,
+        0,
+      );
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(offscreen, dx, dy);
+    };
+
+    const redrawAll = () => {
+      for (const pane of panes) {
+        drawPane(pane.vpId, pane.host, pane.canvas);
+      }
+    };
+
+    redrawAll();
+
+    const cleanups: Array<() => void> = [];
+    for (const pane of panes) {
+      const handler = () => drawPane(pane.vpId, pane.host, pane.canvas);
+      pane.host?.addEventListener(Enums.Events.CAMERA_MODIFIED, handler);
+      pane.host?.addEventListener(Enums.Events.IMAGE_RENDERED, handler);
+      pane.host?.addEventListener(Enums.Events.VOLUME_NEW_IMAGE, handler);
+      cleanups.push(() => {
+        pane.host?.removeEventListener(Enums.Events.CAMERA_MODIFIED, handler);
+        pane.host?.removeEventListener(Enums.Events.IMAGE_RENDERED, handler);
+        pane.host?.removeEventListener(Enums.Events.VOLUME_NEW_IMAGE, handler);
+      });
+    }
+    window.addEventListener('resize', redrawAll);
+
+    return () => {
+      for (const fn of cleanups) fn();
+      window.removeEventListener('resize', redrawAll);
+    };
+  }, [segOverlayEnabled, viewMode, mprSegRevision, hiddenSegments, segOpacity, isSeriesDataCurrent]);
+
+  const syncMeasurements = useCallback(() => {
+    if (!series) {
+      setMeasurements([]);
+      return;
+    }
+    const collected = collectMeasurementsForSeries(
+      annotation.state.getAllAnnotations() as Parameters<typeof collectMeasurementsForSeries>[0],
+      series.series_instance_uid,
+      frames,
+    );
+    setMeasurements(collected);
+  }, [series?.series_instance_uid, frames]);
+
+  useEffect(() => {
+    syncMeasurements();
+    const onAnnotationEvent = () => syncMeasurements();
+    eventTarget.addEventListener(ToolEnums.Events.ANNOTATION_COMPLETED, onAnnotationEvent);
+    eventTarget.addEventListener(ToolEnums.Events.ANNOTATION_MODIFIED, onAnnotationEvent);
+    eventTarget.addEventListener(ToolEnums.Events.ANNOTATION_REMOVED, onAnnotationEvent);
+    return () => {
+      eventTarget.removeEventListener(ToolEnums.Events.ANNOTATION_COMPLETED, onAnnotationEvent);
+      eventTarget.removeEventListener(ToolEnums.Events.ANNOTATION_MODIFIED, onAnnotationEvent);
+      eventTarget.removeEventListener(ToolEnums.Events.ANNOTATION_REMOVED, onAnnotationEvent);
+    };
+  }, [syncMeasurements]);
 
   useEffect(() => {
     if (requestedSliceIndex === null || requestedSliceIndex === undefined) return;
@@ -610,6 +957,7 @@ export function DicomWorkspace({
       return;
     }
     if (!series || !activeFrame) return;
+    setShowMeasurements(false);
     setShowSimilar(true);
     setSimilarLoading(true);
     setSimilarError(null);
@@ -627,6 +975,65 @@ export function DicomWorkspace({
       setSimilarHits([]);
     } finally {
       setSimilarLoading(false);
+    }
+  };
+
+  const handleToggleMeasurements = () => {
+    setShowSimilar(false);
+    setShowMeasurements((prev) => !prev);
+    syncMeasurements();
+  };
+
+  const handleRemoveMeasurement = (uid: string) => {
+    annotation.state.removeAnnotation(uid);
+    syncMeasurements();
+    for (const vpId of viewportIdsRef.current) {
+      engineRef.current?.getViewport(vpId)?.render();
+    }
+  };
+
+  const handleSaveMeasurementSr = async () => {
+    if (!series || measurements.length === 0) return;
+    setSavingSr(true);
+    setSrSaveStatus(null);
+    try {
+      const payload = {
+        findings_note: findingsNote.trim() || undefined,
+        measurements: measurements.map((m) => ({
+          tool: m.tool,
+          label: (measurementLabels[m.uid] ?? m.label).trim() || m.label,
+          sop_instance_uid: m.sop_instance_uid,
+          frame_number: m.frame_number,
+          slice_z_mm: m.slice_z_mm,
+          length_mm: m.length_mm,
+          width_mm: m.width_mm,
+          area_mm2: m.area_mm2,
+          mean_hu: m.mean_hu,
+          std_dev_hu: m.std_dev_hu,
+          unit: m.unit,
+          points_world: m.points_world,
+        })),
+      };
+      if (deidentifyEnabled) {
+        await createMeasurementSrDirect(
+          series.study_instance_uid,
+          series.series_instance_uid,
+          payload,
+        );
+      } else {
+        const dcmBytes = await createMeasurementSrDicom(
+          series.study_instance_uid,
+          series.series_instance_uid,
+          payload,
+        );
+        await stowDicomParts([dcmBytes]);
+      }
+      await onCatalogUpdated?.();
+      setSrSaveStatus('Saved TID 1500 DICOM SR to Lance.');
+    } catch (err) {
+      setSrSaveStatus(err instanceof Error ? err.message : 'Failed to save DICOM SR');
+    } finally {
+      setSavingSr(false);
     }
   };
 
@@ -828,7 +1235,7 @@ export function DicomWorkspace({
         </div>
 
         <div className="toolbar-group" role="group" aria-label="Segmentation and similarity search">
-          {segmentations.length > 0 && viewMode === 'stack' && (
+          {segmentations.length > 0 && (
             <button
               type="button"
               className="btn"
@@ -856,12 +1263,65 @@ export function DicomWorkspace({
           >
             {similarLoading ? 'Searching...' : 'Similar Slices'}
           </button>
+          <button
+            type="button"
+            className="btn"
+            aria-expanded={showMeasurements}
+            onClick={handleToggleMeasurements}
+          >
+            {measurements.length > 0 ? `Measurements (${measurements.length})` : 'Measurements'}
+          </button>
         </div>
       </div>
 
       {loadError && (
         <div role="alert" className="status-banner">
           {loadError}
+        </div>
+      )}
+
+      {segOverlayEnabled && segLegendSegments.length > 0 && viewMode === 'mpr' && (
+        <div className="mpr-seg-bar" role="region" aria-label="3D MPR Segmentation Controls">
+          <div className="seg-toggles-group">
+            {segLegendSegments.map((seg) => {
+              const visible = !hiddenSegments[seg.segment_number];
+              return (
+                <button
+                  key={seg.segment_number}
+                  type="button"
+                  className="seg-toggle-btn"
+                  aria-pressed={visible}
+                  onClick={() => toggleSegmentVisibility(seg.segment_number)}
+                >
+                  <span
+                    className="seg-swatch"
+                    aria-hidden="true"
+                    style={{
+                      backgroundColor: `rgb(${seg.color_rgba[0]}, ${seg.color_rgba[1]}, ${seg.color_rgba[2]})`,
+                    }}
+                  />
+                  <span>{seg.segment_label}</span>
+                </button>
+              );
+            })}
+          </div>
+          <div className="seg-opacity-control">
+            <label htmlFor="seg-opacity-slider">Opacity</label>
+            <input
+              id="seg-opacity-slider"
+              className="seg-opacity-slider"
+              type="range"
+              min={10}
+              max={100}
+              step={5}
+              value={Math.round(segOpacity * 100)}
+              onChange={(e) => setSegOpacity(Number(e.target.value) / 100)}
+            />
+            <span>{Math.round(segOpacity * 100)}%</span>
+            <button type="button" className="btn seg-center-btn" onClick={centerMprCamerasOnSeg}>
+              Center SEG
+            </button>
+          </div>
         </div>
       )}
 
@@ -886,27 +1346,47 @@ export function DicomWorkspace({
                   />
                   {segLegendSegments.length > 0 && (
                     <div className="seg-legend" role="region" aria-label="Segmentation Legend">
-                      {segLegendSegments.map((seg) => {
-                        const isActiveOnSlice = matchedSegLayers.some(
-                          (l) => l.segment.segment_number === seg.segment_number,
-                        );
-                        return (
-                          <span
-                            key={seg.segment_number}
-                            className="seg-legend-item"
-                            data-active={isActiveOnSlice ? 'true' : 'false'}
-                          >
-                            <span
-                              className="seg-swatch"
-                              aria-hidden="true"
-                              style={{
-                                backgroundColor: `rgb(${seg.color_rgba[0]}, ${seg.color_rgba[1]}, ${seg.color_rgba[2]})`,
-                              }}
-                            />
-                            <span>{seg.segment_label}</span>
-                          </span>
-                        );
-                      })}
+                      <div className="seg-toggles-group">
+                        {segLegendSegments.map((seg) => {
+                          const visible = !hiddenSegments[seg.segment_number];
+                          const isActiveOnSlice = matchedSegLayers.some(
+                            (l) => l.segment.segment_number === seg.segment_number,
+                          );
+                          return (
+                            <button
+                              key={seg.segment_number}
+                              type="button"
+                              className="seg-toggle-btn"
+                              aria-pressed={visible}
+                              data-active={isActiveOnSlice ? 'true' : 'false'}
+                              onClick={() => toggleSegmentVisibility(seg.segment_number)}
+                            >
+                              <span
+                                className="seg-swatch"
+                                aria-hidden="true"
+                                style={{
+                                  backgroundColor: `rgb(${seg.color_rgba[0]}, ${seg.color_rgba[1]}, ${seg.color_rgba[2]})`,
+                                }}
+                              />
+                              <span>{seg.segment_label}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="seg-opacity-control">
+                        <label htmlFor="seg-opacity-slider">Opacity</label>
+                        <input
+                          id="seg-opacity-slider"
+                          className="seg-opacity-slider"
+                          type="range"
+                          min={10}
+                          max={100}
+                          step={5}
+                          value={Math.round(segOpacity * 100)}
+                          onChange={(e) => setSegOpacity(Number(e.target.value) / 100)}
+                        />
+                        <span>{Math.round(segOpacity * 100)}%</span>
+                      </div>
                     </div>
                   )}
                 </>
@@ -929,6 +1409,14 @@ export function DicomWorkspace({
                 aria-label="Axial MPR Viewport"
                 onContextMenu={(e) => e.preventDefault()}
               />
+              {segOverlayEnabled && (
+                <canvas
+                  ref={mprSegAxialCanvasRef}
+                  className="viewport-seg-overlay"
+                  data-testid="mpr-seg-overlay-axial"
+                  aria-hidden="true"
+                />
+              )}
               <div className="viewport-hud">Axial · W:{hudWw} L:{hudWc}</div>
             </div>
             <div className="viewport-cell">
@@ -939,6 +1427,14 @@ export function DicomWorkspace({
                 aria-label="Sagittal MPR Viewport"
                 onContextMenu={(e) => e.preventDefault()}
               />
+              {segOverlayEnabled && (
+                <canvas
+                  ref={mprSegSagittalCanvasRef}
+                  className="viewport-seg-overlay"
+                  data-testid="mpr-seg-overlay-sagittal"
+                  aria-hidden="true"
+                />
+              )}
               <div className="viewport-hud">Sagittal</div>
             </div>
             <div className="viewport-cell">
@@ -949,6 +1445,14 @@ export function DicomWorkspace({
                 aria-label="Coronal MPR Viewport"
                 onContextMenu={(e) => e.preventDefault()}
               />
+              {segOverlayEnabled && (
+                <canvas
+                  ref={mprSegCoronalCanvasRef}
+                  className="viewport-seg-overlay"
+                  data-testid="mpr-seg-overlay-coronal"
+                  aria-hidden="true"
+                />
+              )}
               <div className="viewport-hud">Coronal</div>
             </div>
           </div>
@@ -1000,6 +1504,84 @@ export function DicomWorkspace({
                 </li>
               ))}
             </ul>
+          </aside>
+        )}
+
+        {showMeasurements && (
+          <aside className="similar-panel scroller" aria-label="Measurements">
+            <div className="similar-panel-header">
+              <h2 className="similar-panel-title">Measurements</h2>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setShowMeasurements(false)}
+              >
+                Close
+              </button>
+            </div>
+            <p className="similar-panel-sub">
+              Draw with Length, RECIST, or ROI tools, then persist as a DICOM TID 1500 SR via STOW-RS.
+            </p>
+            {srSaveStatus && (
+              <div role="status" aria-live="polite" className="similar-status">
+                {srSaveStatus}
+              </div>
+            )}
+            {measurements.length === 0 ? (
+              <p className="similar-status">No measurements on this series yet.</p>
+            ) : (
+              <ul className="similar-list">
+                {measurements.map((m) => (
+                  <li key={m.uid} className="measurement-card">
+                    <div className="similar-hit-top">
+                      <span className="similar-score-badge">{m.tool}</span>
+                      <button
+                        type="button"
+                        className="btn measurement-remove-btn"
+                        aria-label={`Remove measurement ${measurementLabels[m.uid] ?? m.label}`}
+                        onClick={() => handleRemoveMeasurement(m.uid)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                    <input
+                      type="text"
+                      className="measurement-input"
+                      aria-label={`Label for ${m.tool} measurement`}
+                      value={measurementLabels[m.uid] ?? m.label}
+                      onChange={(e) =>
+                        setMeasurementLabels((prev) => ({ ...prev, [m.uid]: e.target.value }))
+                      }
+                    />
+                    <div className="similar-hit-meta">
+                      {formatMeasurementSummary(m)}
+                      {m.slice_z_mm !== null ? ` · z = ${m.slice_z_mm.toFixed(1)} mm` : ''}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="field-group">
+              <label htmlFor="sr-findings-note" className="similar-panel-sub">
+                Findings Note
+              </label>
+              <textarea
+                id="sr-findings-note"
+                className="measurement-textarea"
+                rows={3}
+                placeholder="Optional clinical impression..."
+                value={findingsNote}
+                onChange={(e) => setFindingsNote(e.target.value)}
+              />
+            </div>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={savingSr || measurements.length === 0}
+              onClick={() => void handleSaveMeasurementSr()}
+            >
+              {savingSr ? 'Saving SR...' : 'Save DICOM SR (STOW-RS)'}
+            </button>
           </aside>
         )}
       </div>

@@ -23,8 +23,9 @@ use crate::codecs::{
     negotiate_wado_accept, transcode_frame_for_wado, SUPPORTED_WADO_TRANSFER_SYNTAXES,
 };
 use crate::deid::DeidConfig;
-use crate::dicom_ingest::{parse_dicom_instances_with_deid, IngestError};
+use crate::dicom_ingest::{parse_dicom_instances, parse_dicom_instances_with_deid, IngestError};
 use crate::phantom::{generate_phantom_dicom_files, PhantomError};
+use crate::sr::{build_tid1500_measurement_sr, MeasurementSrRequest};
 use crate::store::{
     DicomLanceStore, IngestReport, MaintenanceOptions, SearchMode, StoreError, StoreStats,
     StudySummary,
@@ -288,6 +289,10 @@ pub fn build_router_with_config(
             get(get_series_segmentations),
         )
         .route(
+            "/api/studies/{study}/series/{series}/measurements/sr",
+            post(create_measurement_sr),
+        )
+        .route(
             "/api/studies/{study}/series/{series}/instances/{sop}/frames/{frame}/similar",
             get(similar_frames),
         )
@@ -492,6 +497,59 @@ async fn get_series_segmentations(
         "referenced_series_instance_uid": series,
         "segmentations": segmentations,
     })))
+}
+
+async fn create_measurement_sr(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((study, series)): AxumPath<(String, String)>,
+    Json(req): Json<MeasurementSrRequest>,
+) -> Result<Response, ApiError> {
+    let parent = state
+        .store
+        .get_series_summary(&study, &series)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("series not found: {study}/{series}")))?;
+
+    let generated = build_tid1500_measurement_sr(&parent, &req).map_err(ApiError::BadRequest)?;
+    let wants_raw_dicom = headers
+        .get(ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| {
+            let low = a.to_ascii_lowercase();
+            low.contains("application/dicom") && !low.contains("application/dicom+json")
+        });
+
+    if wants_raw_dicom {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/dicom")
+            .header("x-series-instance-uid", &generated.series_instance_uid)
+            .header("x-sop-instance-uid", &generated.sop_instance_uid)
+            .body(Body::from(generated.dcm_bytes))
+            .map_err(|e| ApiError::BadRequest(e.to_string()));
+    }
+
+    let raw_bytes = Bytes::from(generated.dcm_bytes);
+    let parsed = tokio::task::spawn_blocking(move || parse_dicom_instances(&[raw_bytes]))
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))??;
+    let sr_text = parsed
+        .first()
+        .map(|s| s.series.sr_text.clone())
+        .unwrap_or_default();
+    let report = state.store.ingest(&parsed).await?;
+
+    Ok(Json(serde_json::json!({
+        "study_instance_uid": generated.study_instance_uid,
+        "series_instance_uid": generated.series_instance_uid,
+        "sop_instance_uid": generated.sop_instance_uid,
+        "sr_text": sr_text,
+        "series_ingested": report.series_ingested,
+        "frames_ingested": report.frames_ingested,
+        "study_uids": report.study_uids,
+    }))
+    .into_response())
 }
 
 async fn get_series_thumbnail(

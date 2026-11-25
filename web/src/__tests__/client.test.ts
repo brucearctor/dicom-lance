@@ -4,20 +4,31 @@ import {
   buildWadoImageId,
   compactDatasets,
   computeVoiRange,
+  createMeasurementSrDicom,
+  createMeasurementSrDirect,
   deleteStudy,
   type FrameDescriptor,
   getAuthHeaders,
   getAuthToken,
   type SegmentationMetadata,
   setAuthToken,
+  stowDicomParts,
   uploadDicomFiles,
 } from '../api/client';
-import { resolveEnhancedFrameMetadata } from '../cornerstone/seriesMapping';
 import {
+  collectMeasurementsForSeries,
+  type CornerstoneAnnotationLike,
+  formatMeasurementSummary,
+  wrapDicomInMultipartRelated,
+} from '../cornerstone/measurements';
+import {
+  buildSegVolumeLayers,
   compositeSegMasksRgba,
   extractMultipartFirstPart,
   findMatchingSegFrames,
+  resliceSegVolumesToCanvasRgba,
 } from '../cornerstone/segOverlay';
+import { resolveEnhancedFrameMetadata } from '../cornerstone/seriesMapping';
 
 describe('DICOM Lance API helpers', () => {
   it('computes VOI window/level range safely', () => {
@@ -250,6 +261,263 @@ describe('DICOM Lance API helpers', () => {
     setAuthToken(null);
     expect(getAuthToken()).toBeNull();
     vi.unstubAllGlobals();
+  });
+
+  it('scales SEG overlay opacity monotonically and builds + reslices 3D SEG volumes for MPR', () => {
+    const mask = new Uint8Array(4 * 4).fill(1);
+    const fullOpacity = compositeSegMasksRgba(
+      4,
+      4,
+      [{ mask, colorRgba: [220, 60, 40, 128] }],
+      1.0,
+    );
+    const halfOpacity = compositeSegMasksRgba(
+      4,
+      4,
+      [{ mask, colorRgba: [220, 60, 40, 128] }],
+      0.5,
+    );
+    expect(fullOpacity[3]).toBeGreaterThan(0);
+    expect(halfOpacity[3]).toBeLessThan(fullOpacity[3]);
+
+    const segSeries = '1.2.3.seg';
+    const segSop = '1.2.3.seg.sop.1';
+    const refSeries = '1.2.3.ct';
+    const segMeta: SegmentationMetadata = {
+      seg_series_instance_uid: segSeries,
+      seg_sop_instance_uid: segSop,
+      series_description: 'Test SEG',
+      segmentation_type: 'BINARY',
+      referenced_series_uid: refSeries,
+      rows: 4,
+      columns: 4,
+      segments: [
+        {
+          segment_number: 1,
+          segment_label: 'Test Core',
+          segment_description: 'Solid nodule core',
+          color_rgba: [239, 68, 68, 128],
+        },
+      ],
+      frames: [0, 1, 2, 3].map((idx) => ({
+        seg_frame_number: idx + 1,
+        segment_number: 1,
+        referenced_sop_instance_uid: `sop-${idx}`,
+        ipp: [0, 0, idx],
+      })),
+    };
+
+    const ctFrames: FrameDescriptor[] = [0, 1, 2, 3].map((idx) => ({
+      sop_instance_uid: `sop-${idx}`,
+      sop_class_uid: '1.2.840.10008.5.1.4.1.1.2',
+      frame_number: 1,
+      instance_number: idx + 1,
+      slice_sort_index: idx,
+      rows: 4,
+      columns: 4,
+      window_center: 40,
+      window_width: 400,
+      slice_location: idx,
+      ipp_z: idx,
+      transfer_syntax_uid: '1.2.840.10008.1.2.1',
+    }));
+
+    const solidMask = new Uint8Array(4 * 4).fill(1);
+    const masks = new Map<string, Uint8Array>(
+      [1, 2, 3, 4].map((frameNum) => [`${segSeries}:${segSop}:${frameNum}`, solidMask]),
+    );
+    const volumes = buildSegVolumeLayers([segMeta], ctFrames, masks);
+    expect(volumes).toHaveLength(1);
+    expect(volumes[0].segmentLabel).toBe('Test Core');
+    expect(volumes[0].dims).toEqual([4, 4, 4]);
+    expect(volumes[0].bbox).toEqual([0, 0, 0, 3, 3, 3]);
+
+    // Axial plane at z = 1.5 across x = [0, 3], y = [0, 3]
+    const resliced = resliceSegVolumesToCanvasRgba(
+      8,
+      8,
+      volumes,
+      {},
+      0.8,
+      [0, 0, 1.5],
+      [3, 0, 1.5],
+      [0, 3, 1.5],
+    );
+    expect(resliced).not.toBeNull();
+    expect(resliced!.rgba[3]).toBeGreaterThan(0);
+
+    // Hiding the segment suppresses all pixels cleanly
+    const hiddenResliced = resliceSegVolumesToCanvasRgba(
+      8,
+      8,
+      volumes,
+      { 1: true },
+      0.8,
+      [0, 0, 1.5],
+      [3, 0, 1.5],
+      [0, 3, 1.5],
+    );
+    expect(hiddenResliced).toBeNull();
+  });
+
+  it('extracts Cornerstone Length/Bidirectional/ROI annotations and wraps STOW-RS DICOM parts', async () => {
+    const frames: FrameDescriptor[] = [
+      {
+        sop_instance_uid: '1.2.3.4.5.1',
+        sop_class_uid: '1.2.840.10008.5.1.4.1.1.2',
+        frame_number: 1,
+        instance_number: 1,
+        slice_sort_index: 0,
+        rows: 192,
+        columns: 192,
+        window_center: -600,
+        window_width: 1500,
+        slice_location: -25,
+        ipp_z: -25,
+        transfer_syntax_uid: '1.2.840.10008.1.2.1',
+      },
+    ];
+    const seriesUid = '1.2.3.4.ct';
+    const refId = `wadors:/dicomweb/studies/1.2.3/series/${seriesUid}/instances/1.2.3.4.5.1/frames/1`;
+    const annotations: CornerstoneAnnotationLike[] = [
+      {
+        annotationUID: 'ann-len',
+        metadata: { toolName: 'Length', referencedImageId: refId },
+        data: {
+          label: 'RUL Diameter',
+          handles: { points: [[0, 0, -25], [18, 0, -25]] },
+          cachedStats: {},
+        },
+      },
+      {
+        annotationUID: 'ann-bi',
+        metadata: { toolName: 'Bidirectional', referencedImageId: refId },
+        data: {
+          handles: {
+            points: [
+              [0, 0, -25],
+              [20, 0, -25],
+              [10, -5, -25],
+              [10, 5, -25],
+            ],
+          },
+          cachedStats: { [`imageId:${seriesUid}`]: { length: 20, width: 10, unit: 'mm' } },
+        },
+      },
+      {
+        annotationUID: 'ann-roi',
+        metadata: { toolName: 'EllipticalROI', referencedImageId: refId },
+        data: {
+          handles: { points: [] },
+          cachedStats: {
+            [`imageId:${seriesUid}`]: { area: 125.4, mean: 42.1, stdDev: 14.8, unit: 'mm2' },
+          },
+        },
+      },
+    ];
+
+    const collected = collectMeasurementsForSeries(annotations, seriesUid, frames);
+    expect(collected).toHaveLength(3);
+    expect(collected[0].length_mm).toBeCloseTo(18, 4);
+    expect(collected[0].sop_instance_uid).toBe('1.2.3.4.5.1');
+    expect(formatMeasurementSummary(collected[0])).toBe('18.0 mm');
+    expect(formatMeasurementSummary(collected[1])).toBe('20.0 × 10.0 mm');
+    expect(formatMeasurementSummary(collected[2])).toContain('125.4 mm²');
+    expect(formatMeasurementSummary(collected[2])).toContain('Mean 42.1 HU');
+
+    const payload = new Uint8Array([0x00, 0x44, 0x49, 0x43, 0x4d, 0xff]);
+    const multipart = wrapDicomInMultipartRelated(payload, 'test-boundary');
+    const text = new TextDecoder().decode(multipart);
+    expect(text).toContain('--test-boundary\r\nContent-Type: application/dicom');
+    expect(text).toContain('--test-boundary--\r\n');
+
+    setAuthToken('secret-tok');
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(payload, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/dicom',
+            'X-DICOM-Series-UID': '2.25.1',
+            'X-DICOM-SOP-UID': '2.25.2',
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ series_ingested: 1, frames_ingested: 1, study_uids: ['1.2.3'] }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            study_instance_uid: '1.2.3',
+            series_instance_uid: '2.25.3',
+            sop_instance_uid: '2.25.4',
+            sr_text: 'Imaging Measurement Report',
+            series_ingested: 1,
+            frames_ingested: 1,
+            study_uids: ['1.2.3'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const dcm = await createMeasurementSrDicom('1.2.3', seriesUid, {
+      measurements: [
+        {
+          tool: 'Length',
+          label: 'A',
+          sop_instance_uid: null,
+          frame_number: null,
+          slice_z_mm: null,
+          length_mm: 18,
+          width_mm: null,
+          area_mm2: null,
+          mean_hu: null,
+          std_dev_hu: null,
+          unit: 'mm',
+          points_world: [],
+        },
+      ],
+    });
+    expect(dcm).toEqual(payload);
+    const hdrs0 = new Headers(fetchMock.mock.calls[0][1].headers);
+    expect(hdrs0.get('Accept')).toBe('application/dicom');
+    expect(hdrs0.get('Authorization')).toBe('Bearer secret-tok');
+
+    const stowRes = await stowDicomParts([payload]);
+    expect(stowRes.series_ingested).toBe(1);
+    expect(stowRes.frames_ingested).toBe(1);
+    expect(fetchMock.mock.calls[1][0]).toBe('/dicomweb/studies');
+
+    const directRes = await createMeasurementSrDirect('1.2.3', seriesUid, {
+      measurements: [
+        {
+          tool: 'Length',
+          label: 'B',
+          sop_instance_uid: null,
+          frame_number: null,
+          slice_z_mm: null,
+          length_mm: 12,
+          width_mm: null,
+          area_mm2: null,
+          mean_hu: null,
+          std_dev_hu: null,
+          unit: 'mm',
+          points_world: [],
+        },
+      ],
+    });
+    expect(directRes.series_ingested).toBe(1);
+    const hdrs2 = new Headers(fetchMock.mock.calls[2][1].headers);
+    expect(hdrs2.get('Accept')).toBe('application/json');
   });
 
   afterEach(() => {

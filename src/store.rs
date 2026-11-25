@@ -868,6 +868,31 @@ impl DicomLanceStore {
             .await
     }
 
+    /// Looks up a single series summary row without fetching pixel payloads.
+    pub async fn get_series_summary(
+        &self,
+        study_uid: &str,
+        series_uid: &str,
+    ) -> Result<Option<SeriesSummary>, StoreError> {
+        let Some(dataset) = self.get_series_dataset().await? else {
+            return Ok(None);
+        };
+        let safe_study = validate_sql_literal(study_uid, "study_instance_uid")?;
+        let safe_series = validate_sql_literal(series_uid, "series_instance_uid")?;
+
+        let mut scanner = dataset.scan();
+        scanner.project(SERIES_PROJECTION)?;
+        scanner.filter(&format!(
+            "study_instance_uid = '{safe_study}' AND series_instance_uid = '{safe_series}'"
+        ))?;
+        scanner.limit(Some(1), None)?;
+
+        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+        Ok(Self::extract_series_rows(&batches, None, false)
+            .into_iter()
+            .next())
+    }
+
     pub async fn search_series_with_mode(
         &self,
         query: Option<&str>,

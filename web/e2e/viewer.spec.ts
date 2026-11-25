@@ -389,19 +389,39 @@ test.describe('DICOM on Lance Workstation (Hermetic Tier-2 E2E)', () => {
     await page.getByRole('button', { name: 'Hybrid', exact: true }).click();
     await expect(page.getByText(/Showing 1 studies/)).toBeVisible();
 
-    // Toggle DICOM SEG Overlay and verify overlay canvas + legend
+    // Toggle DICOM SEG Overlay and verify overlay canvas + interactive controls
     const segBtn = page.getByRole('button', { name: 'SEG Overlay' });
     await expect(segBtn).toBeEnabled({ timeout: 15_000 });
     await segBtn.click();
     await expect(page.getByTestId('seg-overlay-canvas')).toBeVisible();
-    await expect(page.getByText('RUL Nodule Solid Core')).toBeVisible();
+    const coreToggle = page.getByRole('button', { name: /RUL Nodule Solid Core/i });
+    await expect(coreToggle).toBeVisible();
+    await expect(coreToggle).toHaveAttribute('aria-pressed', 'true');
+    await coreToggle.click();
+    await expect(coreToggle).toHaveAttribute('aria-pressed', 'false');
+    await coreToggle.click();
+    await expect(coreToggle).toHaveAttribute('aria-pressed', 'true');
 
-    // WCAG 2.2 AA accessibility audit with Similar Slices panel and SEG Overlay both expanded
+    const opacitySlider = page.locator('#seg-opacity-slider');
+    await expect(opacitySlider).toBeVisible();
+    await opacitySlider.fill('60');
+    await expect(page.getByText('60%')).toBeVisible();
+
+    // Open Measurements drawer alongside SEG controls
+    const measBtn = page.getByRole('button', { name: /Measurements/i });
+    await measBtn.click();
+    const measPanel = page.getByRole('complementary', { name: 'Measurements' });
+    await expect(measPanel).toBeVisible();
+
+    // WCAG 2.2 AA accessibility audit with Similar Slices, Measurements, and SEG Overlay expanded
     const a11yResults = await new AxeBuilder({ page })
       .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
       .options({ rules: { 'target-size': { enabled: true } } })
       .analyze();
     expect(a11yResults.violations).toEqual([]);
+
+    await measPanel.getByRole('button', { name: 'Close' }).click();
+    await expect(measPanel).toBeHidden();
 
     // Verify modality filter and SR view
     await page.getByRole('button', { name: 'SR', exact: true }).click();

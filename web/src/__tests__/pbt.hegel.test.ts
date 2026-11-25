@@ -9,7 +9,13 @@ import {
   type FrameDescriptor,
 } from '../api/client';
 import { mapSeriesFramesToMetadata } from '../cornerstone/seriesMapping';
-import { compositeSegMasksRgba, extractMultipartFirstPart } from '../cornerstone/segOverlay';
+import {
+  compositeSegMasksRgba,
+  extractMultipartFirstPart,
+  resliceSegVolumesToCanvasRgba,
+  type SegSegmentVolume,
+} from '../cornerstone/segOverlay';
+import { wrapDicomInMultipartRelated } from '../cornerstone/measurements';
 
 const uidGen = gs.fromRegex('1\\.2\\.[0-9]{1,6}(\\.[0-9]{1,6}){1,5}');
 
@@ -185,6 +191,86 @@ describe('Hegel PBT — frontend helpers & Cornerstone frame mapping', () => {
       joined.set(mask, prefix.length);
       joined.set(suffix, prefix.length + mask.length);
       expect(extractMultipartFirstPart(`multipart/related; boundary="${bnd}"`, joined)).toEqual(mask);
+    });
+  });
+
+  test('monotonic opacity and hidden segment suppression across arbitrary 3D SEG reslice planes', () => {
+    hegel.test((tc) => {
+      const width = tc.draw(gs.integers({ minValue: 4, maxValue: 24 }));
+      const height = tc.draw(gs.integers({ minValue: 4, maxValue: 24 }));
+      const lowOpacity = tc.draw(
+        gs.floats({ minValue: 0.1, maxValue: 0.45, allowNan: false, allowInfinity: false }),
+      );
+      const highOpacity = tc.draw(
+        gs.floats({ minValue: 0.55, maxValue: 1.0, allowNan: false, allowInfinity: false }),
+      );
+
+      const numSlices = 4;
+      const rows = 4;
+      const cols = 4;
+      const data = new Uint8Array(numSlices * rows * cols).fill(1);
+      const volume: SegSegmentVolume = {
+        segmentNumber: 1,
+        segmentLabel: 'Solid Core',
+        colorRgba: [239, 68, 68, 128],
+        dims: [cols, rows, numSlices],
+        data,
+        bbox: [0, 0, 0, cols - 1, rows - 1, numSlices - 1],
+        centroidIjk: [1.5, 1.5, 1.5],
+      };
+
+      const lowRes = resliceSegVolumesToCanvasRgba(
+        width,
+        height,
+        [volume],
+        {},
+        lowOpacity,
+        [0, 0, 1],
+        [cols - 1, 0, 1],
+        [0, rows - 1, 1],
+      );
+      const highRes = resliceSegVolumesToCanvasRgba(
+        width,
+        height,
+        [volume],
+        {},
+        highOpacity,
+        [0, 0, 1],
+        [cols - 1, 0, 1],
+        [0, rows - 1, 1],
+      );
+      expect(lowRes).not.toBeNull();
+      expect(highRes).not.toBeNull();
+      expect(lowRes!.rgba[3]).toBeGreaterThan(0);
+      expect(lowRes!.rgba[3]).toBeLessThanOrEqual(highRes!.rgba[3]);
+
+      const hiddenRes = resliceSegVolumesToCanvasRgba(
+        width,
+        height,
+        [volume],
+        { 1: true },
+        highOpacity,
+        [0, 0, 1],
+        [cols - 1, 0, 1],
+        [0, rows - 1, 1],
+      );
+      expect(hiddenRes).toBeNull();
+    });
+  });
+
+  test('round-trips arbitrary DICOM payload bytes through STOW-RS multipart/related wrapping', () => {
+    hegel.test((tc) => {
+      const bnd = tc.draw(gs.fromRegex('stow-[A-Za-z0-9]{4,12}'));
+      const arr = tc.draw(
+        gs.arrays(gs.integers({ minValue: 0, maxValue: 255 }), { minSize: 8, maxSize: 256 }),
+      );
+      const payload = Uint8Array.from(arr);
+      const wrapped = wrapDicomInMultipartRelated(payload, bnd);
+      const unpacked = extractMultipartFirstPart(
+        `multipart/related; type="application/dicom"; boundary="${bnd}"`,
+        wrapped,
+      );
+      expect(unpacked).toEqual(payload);
     });
   });
 });

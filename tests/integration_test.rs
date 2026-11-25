@@ -1958,3 +1958,268 @@ async fn delete_study_and_lance_compact_cleanup_lifecycle() {
     assert_eq!(empty_json["series"]["row_count"], 0);
     assert_eq!(empty_json["frames"]["row_count"], 0);
 }
+
+#[tokio::test]
+async fn measurement_tid1500_sr_stow_rs_round_trip_and_hybrid_search() {
+    let tmp = TempDir::new().unwrap();
+    let store = Arc::new(DicomLanceStore::new(tmp.path()));
+    seed_phantoms_into_store(&store).await.unwrap();
+    let app = build_router(store.clone(), None);
+
+    let frames = store
+        .get_series_frame_descriptors(CT_STUDY_UID, CT_SERIES_UID)
+        .await
+        .unwrap();
+    let target_frame = &frames[23];
+
+    // 1. Validation rejects empty measurements array with 400 Bad Request
+    let empty_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/measurements/sr"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/dicom")
+                .body(Body::from(
+                    serde_json::json!({
+                        "series_description": "Empty SR",
+                        "measurements": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_res.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Unknown parent series returns 404 Not Found
+    let missing_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/studies/{CT_STUDY_UID}/series/1.2.3.4.999999/measurements/sr"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/dicom")
+                .body(Body::from(
+                    serde_json::json!({
+                        "measurements": [{
+                            "tool": "Length",
+                            "label": "Missing",
+                            "length_mm": 10.0
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_res.status(), StatusCode::NOT_FOUND);
+
+    // 3. Serialize TID 1500 DICOM SR (Accept: application/dicom) & store via STOW-RS
+    let sr_payload = serde_json::json!({
+        "series_description": "Viewer Measurement Report (TID 1500)",
+        "findings_note": "Spiculated RUL nodule shows 18.4 mm diameter requiring PET-CT correlation.",
+        "measurements": [
+            {
+                "tool": "Length",
+                "label": "RUL Index Lesion AX",
+                "sop_instance_uid": target_frame.sop_instance_uid,
+                "frame_number": target_frame.frame_number,
+                "slice_z_mm": target_frame.ipp_z,
+                "length_mm": 18.4,
+                "unit": "mm",
+                "points_world": [[-65.0, -12.0, target_frame.ipp_z], [-46.6, -12.0, target_frame.ipp_z]]
+            },
+            {
+                "tool": "Bidirectional",
+                "label": "RUL RECIST Target",
+                "sop_instance_uid": target_frame.sop_instance_uid,
+                "frame_number": target_frame.frame_number,
+                "slice_z_mm": target_frame.ipp_z,
+                "length_mm": 18.4,
+                "width_mm": 14.1,
+                "unit": "mm"
+            },
+            {
+                "tool": "EllipticalROI",
+                "label": "Core Attenuation ROI",
+                "sop_instance_uid": target_frame.sop_instance_uid,
+                "frame_number": target_frame.frame_number,
+                "slice_z_mm": target_frame.ipp_z,
+                "area_mm2": 142.5,
+                "mean_hu": 42.3,
+                "std_dev_hu": 18.7,
+                "unit": "mm2"
+            }
+        ]
+    });
+
+    let sr_dcm_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/measurements/sr"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/dicom")
+                .body(Body::from(sr_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sr_dcm_res.status(), StatusCode::OK);
+    assert_eq!(
+        sr_dcm_res.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/dicom"
+    );
+    let generated_series_uid = sr_dcm_res
+        .headers()
+        .get("x-series-instance-uid")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let dcm_bytes = sr_dcm_res.into_body().collect().await.unwrap().to_bytes();
+
+    let parsed_dcm = from_reader(std::io::Cursor::new(&dcm_bytes)).unwrap();
+    assert_eq!(
+        parsed_dcm
+            .element(tags::SOP_CLASS_UID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_end_matches('\0'),
+        uids::COMPREHENSIVE_SR_STORAGE
+    );
+
+    let boundary = "sr-stow-boundary";
+    let mut multipart = Vec::new();
+    multipart.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Type: application/dicom\r\nContent-Length: {}\r\n\r\n",
+            dcm_bytes.len()
+        )
+        .as_bytes(),
+    );
+    multipart.extend_from_slice(&dcm_bytes);
+    multipart.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let stow_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dicomweb/studies")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/related; type=\"application/dicom\"; boundary=\"{boundary}\""),
+                )
+                .body(Body::from(multipart))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stow_res.status(), StatusCode::OK);
+    let stow_json: serde_json::Value =
+        serde_json::from_slice(&stow_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(stow_json["series_ingested"], 1);
+    assert_eq!(stow_json["frames_ingested"], 0);
+
+    // Hybrid search immediately retrieves the newly stored TID 1500 SR under CT_STUDY_UID
+    let search_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/search?q=PET-CT+correlation&mode=hybrid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(search_res.status(), StatusCode::OK);
+    let search_json: serde_json::Value =
+        serde_json::from_slice(&search_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    let studies = search_json["studies"].as_array().unwrap();
+    let ct_study = studies
+        .iter()
+        .find(|s| s["study_instance_uid"] == CT_STUDY_UID)
+        .expect("CT study present in hybrid search after SR STOW-RS");
+    let matching_sr = ct_study["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["series_instance_uid"] == generated_series_uid)
+        .expect("Generated TID 1500 SR series present in study");
+    assert_eq!(matching_sr["modality"], "SR");
+    let sr_text = matching_sr["sr_text"].as_str().unwrap();
+    assert!(sr_text.contains("RUL Index Lesion AX"));
+    assert!(sr_text.contains("PET-CT correlation"));
+
+    // 4. Direct JSON mode (Accept: application/json) ingests immediately without client STOW-RS
+    let direct_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/measurements/sr"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "series_description": "Direct JSON Measurement SR",
+                        "findings_note": "Followup bronchoscopy correlation recommended.",
+                        "measurements": [{
+                            "tool": "Length",
+                            "label": "Halo Diameter",
+                            "length_mm": 22.1,
+                            "unit": "mm"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_res.status(), StatusCode::OK);
+    let direct_json: serde_json::Value =
+        serde_json::from_slice(&direct_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(direct_json["series_ingested"], 1);
+    assert_eq!(direct_json["frames_ingested"], 0);
+    let direct_series_uid = direct_json["series_instance_uid"].as_str().unwrap();
+    assert!(direct_series_uid.starts_with("2.25."));
+
+    let bm25_res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/search?q=bronchoscopy+correlation&mode=bm25")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bm25_res.status(), StatusCode::OK);
+    let bm25_json: serde_json::Value =
+        serde_json::from_slice(&bm25_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let direct_found = bm25_json["studies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["series"].as_array().unwrap().iter())
+        .any(|ser| ser["series_instance_uid"] == direct_series_uid);
+    assert!(direct_found);
+}

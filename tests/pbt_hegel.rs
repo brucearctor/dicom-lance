@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::sync::OnceLock;
 
 use axum::http::header::RANGE;
 use axum::http::{HeaderMap, HeaderValue};
@@ -8,7 +9,7 @@ use dicom_core::{DataElement, Length, PrimitiveValue, Tag, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_lance::api::{
     constant_time_token_eq, encode_multipart_related, extract_boundary, parse_cors_origins,
-    parse_frame_numbers, parse_range_header, split_multipart_related,
+    parse_frame_numbers, parse_range_header, seed_phantoms_into_store, split_multipart_related,
 };
 use dicom_lance::codecs::{
     encode_rle_lossless_frame, negotiate_wado_accept, NegotiatedTransferSyntax, TS_DEFLATED_IMAGE_FRAME,
@@ -19,9 +20,13 @@ use dicom_lance::dicom_ingest::{
     extract_sr_text, parse_dicom_instances, render_thumbnail_png, slice_normal_projection,
 };
 use dicom_lance::embedding::{rrf_fuse, Embedder, LocalMultimodalEmbedder};
+use dicom_lance::phantom::{CT_SERIES_UID, CT_STUDY_UID};
 use dicom_lance::schema::{FrameRecord, SeriesRecord, EMBEDDING_DIM};
 use dicom_lance::seg::{dicom_cielab_to_rgb, rgb_to_dicom_cielab, unpack_bitpacked_frames};
-use dicom_lance::store::{parse_storage_root, validate_sql_literal, DicomLanceStore};
+use dicom_lance::sr::{
+    build_tid1500_measurement_sr, MeasurementInput, MeasurementSrRequest, MeasurementToolKind,
+};
+use dicom_lance::store::{parse_storage_root, validate_sql_literal, DicomLanceStore, SeriesSummary};
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 use hegel::generators as gs;
 use hegel::{Settings, TestCase};
@@ -1368,4 +1373,183 @@ fn pbt_constant_time_token_eq_and_cors_origin_validation(tc: TestCase) {
         "https://bad host.org",
     ]));
     assert!(parse_cors_origins(&[bad_origin.to_string()]).is_err());
+}
+
+fn sample_ct_series_summary() -> &'static SeriesSummary {
+    static SUMMARY: OnceLock<SeriesSummary> = OnceLock::new();
+    SUMMARY.get_or_init(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let store = DicomLanceStore::new(tmp.path());
+            seed_phantoms_into_store(&store).await.unwrap();
+            store
+                .get_series_summary(CT_STUDY_UID, CT_SERIES_UID)
+                .await
+                .unwrap()
+                .unwrap()
+        })
+    })
+}
+
+#[hegel::test]
+fn pbt_tid1500_measurement_sr_round_trip_and_extraction(tc: TestCase) {
+    let base = sample_ct_series_summary();
+    let suffix = tc.draw(gs::from_regex(r"[A-Za-z0-9]{4,12}"));
+    let finding = tc.draw(gs::from_regex(r"[A-Za-z0-9][A-Za-z0-9 ]{4,24}[A-Za-z0-9]"));
+    let length_mm = tc.draw(gs::floats::<f64>().min_value(1.5).max_value(180.0));
+    let long_axis_mm = tc.draw(gs::floats::<f64>().min_value(2.0).max_value(120.0));
+    let short_axis_mm = tc.draw(gs::floats::<f64>().min_value(1.0).max_value(80.0));
+    let area_mm2 = tc.draw(gs::floats::<f64>().min_value(4.0).max_value(900.0));
+    let mean_hu = tc.draw(gs::floats::<f64>().min_value(-900.0).max_value(1200.0));
+    let std_dev_hu = tc.draw(gs::floats::<f64>().min_value(0.5).max_value(200.0));
+    let slice_z = tc.draw(gs::floats::<f64>().min_value(-250.0).max_value(250.0));
+
+    let mut parent = base.clone();
+    let study_uid = format!("1.2.826.0.1.3680043.10.5432.{}", tc.draw(gs::integers::<u32>().min_value(1000).max_value(999999)));
+    let series_uid = format!("1.2.826.0.1.3680043.10.5432.{}", tc.draw(gs::integers::<u32>().min_value(1000000).max_value(9999999)));
+    let ref_sop = format!("1.2.826.0.1.3680043.10.5432.{}", tc.draw(gs::integers::<u32>().min_value(10000000).max_value(99999999)));
+    parent.study_instance_uid = study_uid.clone();
+    parent.series_instance_uid = series_uid.clone();
+    parent.patient_id = format!("PAT-{suffix}");
+
+    // Validation rejects empty measurements and non-finite metrics
+    assert!(build_tid1500_measurement_sr(
+        &parent,
+        &MeasurementSrRequest {
+            series_description: None,
+            findings_note: None,
+            measurements: vec![],
+            deidentify: None,
+        },
+    )
+    .is_err());
+    assert!(build_tid1500_measurement_sr(
+        &parent,
+        &MeasurementSrRequest {
+            series_description: None,
+            findings_note: None,
+            measurements: vec![MeasurementInput {
+                tool: MeasurementToolKind::Length,
+                label: "Invalid".to_string(),
+                sop_instance_uid: Some(ref_sop.clone()),
+                frame_number: Some(1),
+                slice_z_mm: Some(slice_z),
+                length_mm: Some(f64::NAN),
+                width_mm: None,
+                area_mm2: None,
+                mean_hu: None,
+                std_dev_hu: None,
+                unit: None,
+                points_world: vec![],
+            }],
+            deidentify: None,
+        },
+    )
+    .is_err());
+
+    let l_label = format!("LesionLen-{suffix}");
+    let b_label = format!("Recist-{suffix}");
+    let r_label = format!("NoduleRoi-{suffix}");
+    let sr_desc = format!("TID1500-{suffix}");
+
+    let generated = build_tid1500_measurement_sr(
+        &parent,
+        &MeasurementSrRequest {
+            series_description: Some(sr_desc.clone()),
+            findings_note: Some(finding.clone()),
+            measurements: vec![
+                MeasurementInput {
+                    tool: MeasurementToolKind::Length,
+                    label: l_label.clone(),
+                    sop_instance_uid: Some(ref_sop.clone()),
+                    frame_number: Some(1),
+                    slice_z_mm: Some(slice_z),
+                    length_mm: Some(length_mm),
+                    width_mm: None,
+                    area_mm2: None,
+                    mean_hu: None,
+                    std_dev_hu: None,
+                    unit: Some("mm".to_string()),
+                    points_world: vec![[-10.0, 0.0, slice_z], [10.0, 0.0, slice_z]],
+                },
+                MeasurementInput {
+                    tool: MeasurementToolKind::Bidirectional,
+                    label: b_label.clone(),
+                    sop_instance_uid: Some(ref_sop.clone()),
+                    frame_number: Some(1),
+                    slice_z_mm: Some(slice_z),
+                    length_mm: Some(long_axis_mm),
+                    width_mm: Some(short_axis_mm),
+                    area_mm2: None,
+                    mean_hu: None,
+                    std_dev_hu: None,
+                    unit: Some("mm".to_string()),
+                    points_world: vec![],
+                },
+                MeasurementInput {
+                    tool: MeasurementToolKind::EllipticalROI,
+                    label: r_label.clone(),
+                    sop_instance_uid: Some(ref_sop.clone()),
+                    frame_number: Some(1),
+                    slice_z_mm: Some(slice_z),
+                    length_mm: None,
+                    width_mm: None,
+                    area_mm2: Some(area_mm2),
+                    mean_hu: Some(mean_hu),
+                    std_dev_hu: Some(std_dev_hu),
+                    unit: Some("mm2".to_string()),
+                    points_world: vec![],
+                },
+            ],
+            deidentify: None,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(generated.study_instance_uid, study_uid);
+    assert_ne!(generated.series_instance_uid, series_uid);
+    assert!(generated.series_instance_uid.starts_with("2.25."));
+    assert!(generated.sop_instance_uid.starts_with("2.25."));
+    assert!(generated.series_instance_uid.len() <= 64);
+    assert!(generated.sop_instance_uid.len() <= 64);
+
+    let sr_obj = dicom_object::from_reader(Cursor::new(&generated.dcm_bytes)).unwrap();
+    assert_eq!(
+        sr_obj.element(tags::SOP_CLASS_UID).unwrap().to_str().unwrap().trim_end_matches('\0'),
+        uids::COMPREHENSIVE_SR_STORAGE
+    );
+    assert_eq!(
+        sr_obj.element(tags::SERIES_DESCRIPTION).unwrap().to_str().unwrap().trim_end_matches('\0'),
+        sr_desc
+    );
+
+    let root_concept = sr_obj
+        .element(tags::CONCEPT_NAME_CODE_SEQUENCE)
+        .unwrap()
+        .items()
+        .unwrap()[0]
+        .element(tags::CODE_MEANING)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(root_concept.trim_end_matches('\0'), "Imaging Measurement Report");
+
+    let parsed = parse_dicom_instances(&[Bytes::from(generated.dcm_bytes)]).unwrap();
+    assert_eq!(parsed.len(), 1);
+    let rec = &parsed[0].series;
+    assert_eq!(rec.modality, "SR");
+    assert_eq!(rec.study_instance_uid, study_uid);
+    assert_eq!(rec.series_instance_uid, generated.series_instance_uid);
+    assert!(rec.searchable_text.contains(&sr_desc));
+    assert!(rec.sr_text.contains(finding.trim()));
+    assert!(rec.sr_text.contains(&l_label));
+    assert!(rec.sr_text.contains(&b_label));
+    assert!(rec.sr_text.contains(&r_label));
+    assert!(rec.sr_text.contains("Length"));
+    assert!(rec.sr_text.contains("Long Axis"));
+    assert!(rec.sr_text.contains("Short Axis"));
+    assert!(rec.sr_text.contains("Area"));
+    assert!(rec.sr_text.contains("Mean"));
+    assert!(rec.sr_text.contains("Standard Deviation"));
 }

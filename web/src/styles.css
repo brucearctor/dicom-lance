@@ -604,28 +604,116 @@ select:focus-visible {
   position: absolute;
   bottom: 0.55rem;
   left: 0.6rem;
+  right: 0.6rem;
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
   gap: 0.45rem 0.75rem;
-  padding: 0.3rem 0.6rem;
+  padding: 0.35rem 0.6rem;
   border-radius: 0.35rem;
-  background-color: rgba(15, 23, 42, 0.9);
+  background-color: rgba(15, 23, 42, 0.92);
   border: 1px solid #334155;
   color: #f8fafc;
   font-size: 0.76rem;
   font-weight: 600;
-  pointer-events: none;
+  pointer-events: auto;
 }
 
-.seg-legend-item {
+.mpr-seg-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 0.85rem;
+  padding: 0.4rem 0.85rem;
+  background-color: #0f172a;
+  border-bottom: 1px solid #334155;
+  color: #f8fafc;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.seg-toggles-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.seg-toggle-btn {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
-  opacity: 0.75;
+  min-height: 30px;
+  min-width: 30px;
+  padding: 0.25rem 0.55rem;
+  border-radius: 0.35rem;
+  border: 1px solid #38bdf8;
+  background-color: #1e293b;
+  color: #f8fafc;
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
 }
 
-.seg-legend-item[data-active="true"] {
-  opacity: 1;
+.seg-toggle-btn[aria-pressed="false"] {
+  border-color: #475569;
+  background-color: #0f172a;
+  color: #cbd5e1;
+  text-decoration: line-through;
+}
+
+.seg-opacity-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.seg-opacity-slider {
+  width: 96px;
+  min-height: 28px;
+  accent-color: #38bdf8;
+}
+
+.seg-center-btn {
+  min-height: 30px;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.76rem;
+  background-color: #1e293b;
+  color: #f8fafc;
+  border-color: #475569;
+}
+
+.measurement-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.55rem;
+  border-radius: 0.45rem;
+  border: 1px solid #475569;
+  background-color: #1e293b;
+}
+
+.measurement-input,
+.measurement-textarea {
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.35rem;
+  border: 1px solid #475569;
+  background-color: #020617;
+  color: #f8fafc;
+  font: inherit;
+  font-size: 0.82rem;
+}
+
+.measurement-remove-btn {
+  min-height: 30px;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.76rem;
+  background-color: #0f172a;
+  color: #fca5a5;
+  border-color: #fca5a5;
 }
 
 .seg-swatch {
