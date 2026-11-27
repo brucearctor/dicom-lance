@@ -34,7 +34,7 @@ impl Drop for BenchTempDir {
 }
 
 async fn send_ok_body(app: &Router, req: Request<Body>) -> Result<usize, String> {
-    let resp = app.clone().oneshot(req).await.map_err(|e| e.to_string())?;
+    let Ok(resp) = app.clone().oneshot(req).await;
     if resp.status() != StatusCode::OK {
         return Err(format!("unexpected HTTP status {}", resp.status()));
     }
