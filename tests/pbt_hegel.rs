@@ -21,6 +21,10 @@ use dicom_lance::dicom_ingest::{
 };
 use dicom_lance::embedding::{rrf_fuse, Embedder, LocalMultimodalEmbedder};
 use dicom_lance::phantom::{CT_SERIES_UID, CT_STUDY_UID};
+use dicom_lance::render::{
+    negotiate_rendered_accept, parse_viewport_param, parse_window_param, render_frame_image,
+    RenderFrameInput, RenderOptions, RenderedImageFormat, VoiLutFunction,
+};
 use dicom_lance::schema::{FrameRecord, SeriesRecord, EMBEDDING_DIM};
 use dicom_lance::seg::{dicom_cielab_to_rgb, rgb_to_dicom_cielab, unpack_bitpacked_frames};
 use dicom_lance::sr::{
@@ -1552,4 +1556,86 @@ fn pbt_tid1500_measurement_sr_round_trip_and_extraction(tc: TestCase) {
     assert!(rec.sr_text.contains("Area"));
     assert!(rec.sr_text.contains("Mean"));
     assert!(rec.sr_text.contains("Standard Deviation"));
+}
+
+#[hegel::test]
+fn pbt_rendered_accept_window_viewport_and_encoding_invariants(tc: TestCase) {
+    // 1. Accept header negotiation respects q-weights and never panics on fuzz inputs
+    let q_png = tc.draw(gs::floats::<f32>().min_value(0.05).max_value(1.0));
+    let q_jpeg = tc.draw(gs::floats::<f32>().min_value(0.05).max_value(1.0));
+    let hdr = format!("image/png;q={q_png:.2}, image/jpeg;q={q_jpeg:.2}");
+    let negotiated = negotiate_rendered_accept(Some(&hdr), false).unwrap();
+    if q_jpeg > q_png + 0.02 {
+        assert_eq!(negotiated.format, RenderedImageFormat::Jpeg);
+    } else if q_png > q_jpeg + 0.02 {
+        assert_eq!(negotiated.format, RenderedImageFormat::Png);
+    }
+    assert!(negotiate_rendered_accept(Some("image/png;q=0, image/jpeg;q=0"), false).is_err());
+    let fuzz_accept = tc.draw(gs::text().max_size(64));
+    let _ = negotiate_rendered_accept(Some(&fuzz_accept), tc.draw(gs::booleans()));
+
+    // 2. Window & Viewport parsers accept valid ranges and reject malformed inputs
+    let wc = tc.draw(gs::floats::<f64>().min_value(-2000.0).max_value(4000.0));
+    let ww = tc.draw(gs::floats::<f64>().min_value(1.0).max_value(6000.0));
+    let func_name = tc.draw(gs::sampled_from(&["LINEAR", "LINEAR_EXACT", "SIGMOID"]));
+    let parsed_w = parse_window_param(&format!("{wc:.2},{ww:.2},{func_name}")).unwrap();
+    assert_eq!(
+        parsed_w.function,
+        match func_name {
+            "LINEAR_EXACT" => VoiLutFunction::LinearExact,
+            "SIGMOID" => VoiLutFunction::Sigmoid,
+            _ => VoiLutFunction::Linear,
+        }
+    );
+    assert!(parse_window_param("40,0,LINEAR").is_err());
+    assert!(parse_window_param("40,-5,SIGMOID").is_err());
+
+    let vw = tc.draw(gs::integers::<u32>().min_value(8).max_value(256));
+    let vh = tc.draw(gs::integers::<u32>().min_value(8).max_value(256));
+    let vp = parse_viewport_param(&format!("{vw},{vh}")).unwrap();
+    assert_eq!((vp.width, vp.height), (vw, vh));
+    assert!(parse_viewport_param("0,128").is_err());
+    assert!(parse_viewport_param("5000,128").is_err());
+
+    // 3. Rendering arbitrary monochrome dimensions produces valid PNG/JPEG with bounded viewport dims
+    let cols = tc.draw(gs::integers::<i32>().min_value(8).max_value(48));
+    let rows = tc.draw(gs::integers::<i32>().min_value(8).max_value(48));
+    let mono1 = tc.draw(gs::booleans());
+    let n_px = (cols * rows) as usize;
+    let mut raw = Vec::with_capacity(n_px * 2);
+    for i in 0..n_px {
+        let val = ((i * 53) % 3000) as u16;
+        raw.extend_from_slice(&val.to_le_bytes());
+    }
+    let frame = RenderFrameInput {
+        rows,
+        columns: cols,
+        samples_per_pixel: 1,
+        bits_allocated: 16,
+        pixel_representation: 0,
+        photometric_interpretation: if mono1 {
+            "MONOCHROME1".to_string()
+        } else {
+            "MONOCHROME2".to_string()
+        },
+        rescale_slope: 1.0,
+        rescale_intercept: -1024.0,
+        window_center: wc,
+        window_width: ww,
+        bytes: raw,
+    };
+    let opts = RenderOptions {
+        window: Some(parsed_w),
+        viewport: Some(vp),
+        quality: 80,
+    };
+    let png_bytes = render_frame_image(&frame, RenderedImageFormat::Png, &opts).unwrap();
+    assert!(png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let out_w = u32::from_be_bytes(png_bytes[16..20].try_into().unwrap());
+    let out_h = u32::from_be_bytes(png_bytes[20..24].try_into().unwrap());
+    assert!(out_w >= 1 && out_w <= vw && out_h >= 1 && out_h <= vh);
+
+    let jpeg_bytes = render_frame_image(&frame, RenderedImageFormat::Jpeg, &opts).unwrap();
+    assert!(jpeg_bytes.starts_with(&[0xff, 0xd8]));
+    assert!(jpeg_bytes.ends_with(&[0xff, 0xd9]));
 }

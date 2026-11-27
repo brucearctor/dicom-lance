@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State};
-use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RANGE, WWW_AUTHENTICATE};
+use axum::http::header::{
+    ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, RANGE, VARY, WWW_AUTHENTICATE,
+};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -25,10 +27,14 @@ use crate::codecs::{
 use crate::deid::DeidConfig;
 use crate::dicom_ingest::{parse_dicom_instances, parse_dicom_instances_with_deid, IngestError};
 use crate::phantom::{generate_phantom_dicom_files, PhantomError};
+use crate::render::{
+    negotiate_rendered_accept, parse_iccprofile_param, parse_quality_param, parse_viewport_param,
+    parse_window_param, render_frame_image, RenderFrameInput, RenderOptions,
+};
 use crate::sr::{build_tid1500_measurement_sr, MeasurementSrRequest};
 use crate::store::{
-    DicomLanceStore, IngestReport, MaintenanceOptions, SearchMode, StoreError, StoreStats,
-    StudySummary,
+    DicomLanceStore, IngestReport, MaintenanceOptions, RenderedFrameBlob, SearchMode, StoreError,
+    StoreStats, StudySummary,
 };
 
 const WADO_BOUNDARY: &str = "dicom-lance-boundary";
@@ -227,6 +233,14 @@ pub struct IngestQuery {
     pub deidentify: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct RenderedQuery {
+    pub window: Option<String>,
+    pub viewport: Option<String>,
+    pub quality: Option<u8>,
+    pub iccprofile: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
     pub mode: SearchMode,
@@ -310,8 +324,20 @@ pub fn build_router_with_config(
             get(wado_series_metadata),
         )
         .route(
+            "/dicomweb/studies/{study}/series/{series}/rendered",
+            get(wado_series_rendered),
+        )
+        .route(
+            "/dicomweb/studies/{study}/series/{series}/instances/{sop}/rendered",
+            get(wado_instance_rendered),
+        )
+        .route(
             "/dicomweb/studies/{study}/series/{series}/instances/{sop}/frames/{frames}",
             get(wado_instance_frames),
+        )
+        .route(
+            "/dicomweb/studies/{study}/series/{series}/instances/{sop}/frames/{frames}/rendered",
+            get(wado_frames_rendered),
         )
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(
@@ -1043,6 +1069,131 @@ async fn wado_instance_frames(
         .header(CONTENT_TYPE, ct_header)
         .body(Body::from(body))
         .map_err(|e| ApiError::BadRequest(e.to_string()))
+}
+
+fn parse_rendered_options(query: &RenderedQuery) -> Result<RenderOptions, ApiError> {
+    parse_iccprofile_param(query.iccprofile.as_deref()).map_err(ApiError::BadRequest)?;
+    let window = match query.window.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => Some(parse_window_param(raw).map_err(ApiError::BadRequest)?),
+        None => None,
+    };
+    let viewport = match query.viewport.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => Some(parse_viewport_param(raw).map_err(ApiError::BadRequest)?),
+        None => None,
+    };
+    let quality = parse_quality_param(query.quality).map_err(ApiError::BadRequest)?;
+    Ok(RenderOptions {
+        window,
+        viewport,
+        quality,
+    })
+}
+
+async fn render_blobs_to_response(
+    blobs: Vec<RenderedFrameBlob>,
+    headers: &HeaderMap,
+    query: &RenderedQuery,
+    force_multipart: bool,
+) -> Result<Response, ApiError> {
+    let opts = parse_rendered_options(query)?;
+    let negotiated = negotiate_rendered_accept(
+        headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
+        force_multipart,
+    )
+    .map_err(ApiError::NotAcceptable)?;
+
+    let rendered_parts = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<u8>>, String> {
+        let mut out = Vec::with_capacity(blobs.len());
+        for blob in blobs {
+            let input = RenderFrameInput {
+                rows: blob.rows,
+                columns: blob.columns,
+                samples_per_pixel: blob.samples_per_pixel,
+                bits_allocated: blob.bits_allocated,
+                pixel_representation: blob.pixel_representation,
+                photometric_interpretation: blob.photometric_interpretation,
+                rescale_slope: blob.rescale_slope,
+                rescale_intercept: blob.rescale_intercept,
+                window_center: blob.window_center,
+                window_width: blob.window_width,
+                bytes: blob.bytes,
+            };
+            out.push(render_frame_image(&input, negotiated.format, &opts)?);
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| ApiError::BadRequest(e.to_string()))?
+    .map_err(ApiError::BadRequest)?;
+
+    let part_ct = negotiated.format.content_type();
+    if negotiated.multipart {
+        let refs: Vec<(&str, &[u8])> = rendered_parts
+            .iter()
+            .map(|bytes| (part_ct, bytes.as_slice()))
+            .collect();
+        let body = encode_multipart_related(WADO_BOUNDARY, &refs);
+        let ct_header = format!(
+            "multipart/related; type=\"{part_ct}\"; boundary=\"{WADO_BOUNDARY}\""
+        );
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, ct_header)
+            .header(CACHE_CONTROL, "public, max-age=300")
+            .header(VARY, "Accept")
+            .body(Body::from(body))
+            .map_err(|e| ApiError::BadRequest(e.to_string()))
+    } else {
+        let payload = rendered_parts.into_iter().next().unwrap_or_default();
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, part_ct)
+            .header(CACHE_CONTROL, "public, max-age=300")
+            .header(VARY, "Accept")
+            .body(Body::from(payload))
+            .map_err(|e| ApiError::BadRequest(e.to_string()))
+    }
+}
+
+async fn wado_series_rendered(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RenderedQuery>,
+    AxumPath((study, series)): AxumPath<(String, String)>,
+) -> Result<Response, ApiError> {
+    let mid = state
+        .store
+        .read_series_middle_frame_for_render(&study, &series)
+        .await?;
+    render_blobs_to_response(vec![mid], &headers, &query, false).await
+}
+
+async fn wado_instance_rendered(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RenderedQuery>,
+    AxumPath((study, series, sop)): AxumPath<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let blobs = state
+        .store
+        .read_frames_for_render(&study, &series, &sop, &[1])
+        .await?;
+    render_blobs_to_response(blobs, &headers, &query, false).await
+}
+
+async fn wado_frames_rendered(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RenderedQuery>,
+    AxumPath((study, series, sop, frames_str)): AxumPath<(String, String, String, String)>,
+) -> Result<Response, ApiError> {
+    let frame_numbers = parse_frame_numbers(&frames_str)?;
+    let force_multipart = frame_numbers.len() > 1;
+    let blobs = state
+        .store
+        .read_frames_for_render(&study, &series, &sop, &frame_numbers)
+        .await?;
+    render_blobs_to_response(blobs, &headers, &query, force_multipart).await
 }
 
 pub async fn serve(

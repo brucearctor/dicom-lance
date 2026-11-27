@@ -2223,3 +2223,149 @@ async fn measurement_tid1500_sr_stow_rs_round_trip_and_hybrid_search() {
         .any(|ser| ser["series_instance_uid"] == direct_series_uid);
     assert!(direct_found);
 }
+
+#[tokio::test]
+async fn wado_rs_rendered_png_jpeg_window_viewport_and_multipart() {
+    let tmp = TempDir::new().unwrap();
+    let store = Arc::new(DicomLanceStore::new(tmp.path()));
+    seed_phantoms_into_store(&store).await.unwrap();
+    let app = build_router(store.clone(), None);
+
+    let frames = store
+        .get_series_frame_descriptors(CT_STUDY_UID, CT_SERIES_UID)
+        .await
+        .unwrap();
+    let sop1 = &frames[0].sop_instance_uid;
+    let sop_mid = &frames[frames.len() / 2].sop_instance_uid;
+
+    // 1. Default Accept + series-level /rendered renders middle slice as PNG
+    let series_png_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/rendered?window=-600,1500&viewport=128,128&iccprofile=srgb"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(series_png_res.status(), StatusCode::OK);
+    assert_eq!(
+        series_png_res.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/png"
+    );
+    assert!(series_png_res.headers().contains_key(header::CACHE_CONTROL));
+    let series_png_bytes = series_png_res.into_body().collect().await.unwrap().to_bytes();
+    assert!(series_png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+    // 2. Instance /rendered returns JPEG when Accept prefers image/jpeg with SIGMOID VOI LUT
+    let inst_jpeg_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/instances/{sop_mid}/rendered?window=-600,1500,SIGMOID&viewport=96,96&quality=70"
+                ))
+                .header(header::ACCEPT, "image/png;q=0.4, image/jpeg;q=0.95")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inst_jpeg_res.status(), StatusCode::OK);
+    assert_eq!(
+        inst_jpeg_res.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/jpeg"
+    );
+    let inst_jpeg_bytes = inst_jpeg_res.into_body().collect().await.unwrap().to_bytes();
+    assert!(inst_jpeg_bytes.starts_with(&[0xff, 0xd8]));
+    assert!(inst_jpeg_bytes.ends_with(&[0xff, 0xd9]));
+
+    // 3. Explicit /frames/1/rendered honors viewport scaling (exact PNG IHDR dimensions)
+    let frame_png_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/instances/{sop1}/frames/1/rendered?viewport=64,96"
+                ))
+                .header(header::ACCEPT, "image/png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(frame_png_res.status(), StatusCode::OK);
+    let frame_png_bytes = frame_png_res.into_body().collect().await.unwrap().to_bytes();
+    assert!(frame_png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let w = u32::from_be_bytes(frame_png_bytes[16..20].try_into().unwrap());
+    let h = u32::from_be_bytes(frame_png_bytes[20..24].try_into().unwrap());
+    assert_eq!((w, h), (64, 64));
+
+    // 4. Multi-frame /frames/1,1/rendered returns multipart/related image/jpeg
+    let multi_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/instances/{sop1}/frames/1,1/rendered"
+                ))
+                .header(header::ACCEPT, "multipart/related; type=\"image/jpeg\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(multi_res.status(), StatusCode::OK);
+    let multi_ct = multi_res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(multi_ct.starts_with("multipart/related; type=\"image/jpeg\""));
+    let multi_bytes = multi_res.into_body().collect().await.unwrap().to_bytes();
+    let part = extract_multipart_part(&multi_bytes, "dicom-lance-boundary");
+    assert!(part.starts_with(&[0xff, 0xd8]));
+
+    // 5. Unsupported Accept triggers 406 Not Acceptable; invalid window/viewport/quality return 400
+    let not_acc_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/dicomweb/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/rendered"
+                ))
+                .header(header::ACCEPT, "image/webp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_acc_res.status(), StatusCode::NOT_ACCEPTABLE);
+
+    for bad_qs in [
+        "window=40,-10",
+        "window=40,400,BOGUS",
+        "viewport=0,128",
+        "quality=0",
+        "iccprofile=cmyk",
+    ] {
+        let bad_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dicomweb/studies/{CT_STUDY_UID}/series/{CT_SERIES_UID}/rendered?{bad_qs}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST, "expected 400 for {bad_qs}");
+    }
+}

@@ -6,12 +6,22 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-# Stage 2: Build Rust Axum + Lance v2.2 binary
-FROM rust:1-bookworm AS rust-builder
+# Stage 2: Prepare cargo-chef dependency recipe
+FROM lukemathwalker/cargo-chef:latest-rust-1-bookworm AS chef
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Stage 3: Cache-cook dependencies and build release Rust binary
+FROM chef AS rust-builder
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json --bin dicom-lance
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked --bin dicom-lance

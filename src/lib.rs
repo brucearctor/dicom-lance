@@ -4,6 +4,7 @@ pub mod deid;
 pub mod dicom_ingest;
 pub mod embedding;
 pub mod phantom;
+pub mod render;
 pub mod schema;
 pub mod seg;
 pub mod sr;

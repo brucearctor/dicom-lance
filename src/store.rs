@@ -274,6 +274,22 @@ pub struct FrameBlobPayload {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RenderedFrameBlob {
+    pub frame_number: i32,
+    pub rows: i32,
+    pub columns: i32,
+    pub samples_per_pixel: i32,
+    pub bits_allocated: i32,
+    pub pixel_representation: i32,
+    pub photometric_interpretation: String,
+    pub rescale_slope: f64,
+    pub rescale_intercept: f64,
+    pub window_center: f64,
+    pub window_width: f64,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimilarFrameHit {
     pub study_instance_uid: String,
@@ -1127,6 +1143,36 @@ impl DicomLanceStore {
         Ok(out)
     }
 
+    async fn read_unique_frame_blobs(
+        dataset: &Arc<Dataset>,
+        sop_label: &str,
+        unique_row_ids: &[u64],
+        byte_range: Option<&Range<u64>>,
+    ) -> Result<HashMap<u64, (String, u64, Vec<u8>)>, StoreError> {
+        let blobs = dataset.take_blobs(unique_row_ids, "pixel_frame_blob").await?;
+        let mut cached_payloads: HashMap<u64, (String, u64, Vec<u8>)> = HashMap::new();
+        for (&rid, blob_opt) in unique_row_ids.iter().zip(blobs) {
+            let blob = blob_opt.ok_or_else(|| {
+                StoreError::NotFound(format!("null pixel blob for {sop_label} row {rid}"))
+            })?;
+            let total_blob_size = blob.size();
+            let blob_kind = format_blob_kind(blob.kind()).to_string();
+            let bytes = match byte_range {
+                Some(r) => {
+                    let clamped_end = r.end.min(total_blob_size);
+                    if r.start >= clamped_end {
+                        Vec::new()
+                    } else {
+                        blob.read_range(r.start..clamped_end).await?.to_vec()
+                    }
+                }
+                None => blob.read().await?.to_vec(),
+            };
+            cached_payloads.insert(rid, (blob_kind, total_blob_size, bytes));
+        }
+        Ok(cached_payloads)
+    }
+
     pub async fn read_frame_blobs(
         &self,
         study_uid: &str,
@@ -1219,27 +1265,9 @@ impl DicomLanceStore {
             }
         }
 
-        let blobs = dataset.take_blobs(&unique_row_ids, "pixel_frame_blob").await?;
-        let mut cached_payloads: HashMap<u64, (String, u64, Vec<u8>)> = HashMap::new();
-        for (rid, blob_opt) in unique_row_ids.into_iter().zip(blobs) {
-            let blob = blob_opt.ok_or_else(|| {
-                StoreError::NotFound(format!("null pixel blob for {sop_uid} row {rid}"))
-            })?;
-            let total_blob_size = blob.size();
-            let blob_kind = format_blob_kind(blob.kind()).to_string();
-            let bytes = match &byte_range {
-                Some(r) => {
-                    let clamped_end = r.end.min(total_blob_size);
-                    if r.start >= clamped_end {
-                        Vec::new()
-                    } else {
-                        blob.read_range(r.start..clamped_end).await?.to_vec()
-                    }
-                }
-                None => blob.read().await?.to_vec(),
-            };
-            cached_payloads.insert(rid, (blob_kind, total_blob_size, bytes));
-        }
+        let cached_payloads =
+            Self::read_unique_frame_blobs(&dataset, sop_uid, &unique_row_ids, byte_range.as_ref())
+                .await?;
 
         let mut results = Vec::with_capacity(requested.len());
         for (frame_number, rid, ts_uid, rows_i, cols_i, spp_i, bits_i) in requested {
@@ -1260,6 +1288,145 @@ impl DicomLanceStore {
         }
 
         Ok(results)
+    }
+
+    pub async fn read_frames_for_render(
+        &self,
+        study_uid: &str,
+        series_uid: &str,
+        sop_uid: &str,
+        frame_numbers: &[i32],
+    ) -> Result<Vec<RenderedFrameBlob>, StoreError> {
+        let Some(dataset) = self.get_frames_dataset().await? else {
+            return Err(StoreError::NotFound("frames dataset does not exist".to_string()));
+        };
+        let safe_study = validate_sql_literal(study_uid, "study_instance_uid")?;
+        let safe_series = validate_sql_literal(series_uid, "series_instance_uid")?;
+        let safe_sop = validate_sql_literal(sop_uid, "sop_instance_uid")?;
+
+        if frame_numbers.is_empty() {
+            return Err(StoreError::InvalidInput("empty frame list".to_string()));
+        }
+        let mut unique_frames = Vec::new();
+        let mut seen_frames = HashSet::new();
+        for &n in frame_numbers {
+            if seen_frames.insert(n) {
+                unique_frames.push(n);
+            }
+        }
+        let in_list = unique_frames
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut scanner = dataset.scan();
+        scanner.project(&[
+            "frame_number",
+            "rows",
+            "columns",
+            "samples_per_pixel",
+            "bits_allocated",
+            "pixel_representation",
+            "photometric_interpretation",
+            "rescale_slope",
+            "rescale_intercept",
+            "window_center",
+            "window_width",
+        ])?;
+        scanner.with_row_id();
+        scanner.filter(&format!(
+            "study_instance_uid = '{safe_study}' AND series_instance_uid = '{safe_series}' AND sop_instance_uid = '{safe_sop}' AND frame_number IN ({in_list})"
+        ))?;
+
+        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+        let mut by_frame: HashMap<i32, (u64, RenderedFrameBlob)> = HashMap::new();
+        for batch in batches {
+            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            let fnums = batch["frame_number"].as_primitive::<Int32Type>();
+            let rows_col = batch["rows"].as_primitive::<Int32Type>();
+            let cols_col = batch["columns"].as_primitive::<Int32Type>();
+            let spp_col = batch["samples_per_pixel"].as_primitive::<Int32Type>();
+            let bits_col = batch["bits_allocated"].as_primitive::<Int32Type>();
+            let rep_col = batch["pixel_representation"].as_primitive::<Int32Type>();
+            let photo_col = batch["photometric_interpretation"].as_string::<i32>();
+            let slope_col = batch["rescale_slope"].as_primitive::<Float64Type>();
+            let int_col = batch["rescale_intercept"].as_primitive::<Float64Type>();
+            let wc_col = batch["window_center"].as_primitive::<Float64Type>();
+            let ww_col = batch["window_width"].as_primitive::<Float64Type>();
+            for i in 0..batch.num_rows() {
+                let fnum = fnums.value(i);
+                by_frame.insert(
+                    fnum,
+                    (
+                        row_ids.value(i),
+                        RenderedFrameBlob {
+                            frame_number: fnum,
+                            rows: rows_col.value(i),
+                            columns: cols_col.value(i),
+                            samples_per_pixel: spp_col.value(i),
+                            bits_allocated: bits_col.value(i),
+                            pixel_representation: rep_col.value(i),
+                            photometric_interpretation: photo_col.value(i).to_string(),
+                            rescale_slope: slope_col.value(i),
+                            rescale_intercept: int_col.value(i),
+                            window_center: wc_col.value(i),
+                            window_width: ww_col.value(i),
+                            bytes: Vec::new(),
+                        },
+                    ),
+                );
+            }
+        }
+
+        let mut requested = Vec::with_capacity(frame_numbers.len());
+        let mut unique_row_ids = Vec::new();
+        let mut seen_rids = HashSet::new();
+        for &fnum in frame_numbers {
+            let (rid, meta) = by_frame
+                .get(&fnum)
+                .ok_or_else(|| StoreError::NotFound(format!("frame {fnum} not found for {sop_uid}")))?;
+            requested.push((*rid, meta.clone()));
+            if seen_rids.insert(*rid) {
+                unique_row_ids.push(*rid);
+            }
+        }
+
+        let cached_payloads =
+            Self::read_unique_frame_blobs(&dataset, sop_uid, &unique_row_ids, None).await?;
+
+        let mut results = Vec::with_capacity(requested.len());
+        for (rid, mut meta) in requested {
+            let (_, _, bytes) = cached_payloads
+                .get(&rid)
+                .ok_or_else(|| StoreError::NotFound(format!("missing blob cache for row {rid}")))?;
+            meta.bytes = bytes.clone();
+            results.push(meta);
+        }
+
+        Ok(results)
+    }
+
+    pub async fn read_series_middle_frame_for_render(
+        &self,
+        study_uid: &str,
+        series_uid: &str,
+    ) -> Result<RenderedFrameBlob, StoreError> {
+        let descriptors = self.get_series_frame_descriptors(study_uid, series_uid).await?;
+        if descriptors.is_empty() {
+            return Err(StoreError::NotFound(format!(
+                "no renderable frames found for series {study_uid}/{series_uid}"
+            )));
+        }
+        let mid = &descriptors[descriptors.len() / 2];
+        let mut frames = self
+            .read_frames_for_render(study_uid, series_uid, &mid.sop_instance_uid, &[mid.frame_number])
+            .await?;
+        frames.pop().ok_or_else(|| {
+            StoreError::NotFound(format!(
+                "missing middle frame blob for series {study_uid}/{series_uid}"
+            ))
+        })
     }
 
     pub async fn get_series_segmentations(

@@ -56,7 +56,7 @@ struct Candidate {
     format: NegotiatedFrameFormat,
 }
 
-fn split_quoted_aware(input: &str, delim: char) -> Vec<String> {
+pub(crate) fn split_quoted_aware(input: &str, delim: char) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
@@ -91,7 +91,7 @@ fn split_quoted_aware(input: &str, delim: char) -> Vec<String> {
     parts
 }
 
-fn unquote(val: &str) -> String {
+pub(crate) fn unquote(val: &str) -> String {
     let trimmed = val.trim();
     if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
         trimmed[1..trimmed.len() - 1].trim().to_string()

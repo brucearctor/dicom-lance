@@ -2222,6 +2222,7 @@ dependencies = [
  "futures",
  "hegeltest",
  "http-body-util",
+ "jpeg-encoder",
  "lance",
  "lance-core",
  "lance-file",

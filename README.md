@@ -43,6 +43,7 @@ flowchart LR
 
 - **Compressed Transfer Syntaxes (`Cargo.toml`, `src/dicom_ingest.rs`)**: Zero-`cmake` decoding across **RLE Lossless** (`1.2.840.10008.1.2.5`), **JPEG Baseline/Extended/Lossless** (`1.2.840.10008.1.2.4.50`/`.51`/`.57`/`.70`), **JPEG 2000 & HTJ2K** (`1.2.840.10008.1.2.4.90`–`.93`, `.201`–`.203` via `cc`-built OpenJPEG `openjpeg-sys`), **Deflated Explicit VR Little Endian** (`1.2.840.10008.1.2.1.99`), **Deflated Image Frame Compression** (`1.2.840.10008.1.2.8.1`), and **JPEG XL Lossless/Recompression** (`1.2.840.10008.1.2.4.110`–`.112` via pure-Rust `jxl-oxide`). Optional C++ JPEG-LS support (`1.2.840.10008.1.2.4.80`/`.81`) is gated behind `--features codec-jpegls`.
 - **WADO-RS `Accept` Transfer-Syntax Negotiation (`src/codecs.rs`, `src/api.rs`)**: `GET /dicomweb/studies/{study}/series/{series}/instances/{sop}/frames/{frames}` negotiates quality-weighted (`q=...`) DICOM PS3.18 `Accept` headers for `ExplicitVRLittleEndian` (`1.2.840.10008.1.2.1`), `ImplicitVRLittleEndian` (`1.2.840.10008.1.2`), `RLELossless` (`1.2.840.10008.1.2.5` / `image/dicom-rle` via pure-Rust PackBits Annex G encoder), and `DeflatedImageFrame` (`1.2.840.10008.1.2.8.1`), returning `406 Not Acceptable` with supported transfer syntaxes when requested formats are unsupported or combined with HTTP `Range`.
+- **WADO-RS `/rendered` Server-Side PNG/JPEG Rendering (`src/render.rs`, `src/store.rs`, `src/api.rs`)**: Supports PS3.18 `/series/{series}/rendered`, `/instances/{sop}/rendered`, and `/frames/{frames}/rendered` with quality-weighted `Accept` negotiation (`image/png`, `image/jpeg`, `multipart/related`), `window=center,width[,LINEAR|LINEAR_EXACT|SIGMOID]`, aspect-preserving bilinear `viewport=vw,vh`, `quality=1..100`, `iccprofile`, and `MONOCHROME1` inversion.
 - **Enhanced Multi-Frame CT/MR (`src/dicom_ingest.rs`, `web/src/cornerstone/seriesMapping.ts`)**: Extracts Shared (`5200,9229`) and Per-Frame (`5200,9230`) Functional Groups (`PlanePositionSequence`, `PlaneOrientationSequence`, `PixelMeasuresSequence`, `FrameVOILUTSequence`, `PixelValueTransformationSequence`) for per-frame 3D normal slice sorting, `spacing_z_mm` calculation, and Cornerstone3D per-frame metadata projection.
 - **DICOM SEG Storage & 2D/3D MPR Overlay (`src/seg.rs`, `src/phantom.rs`, `web/src/cornerstone/`)**: Unpacks 1-bit packed (`BitsAllocated=1`) binary segmentations into 8-bit Lance Blob V2 frames, decodes `SegmentSequence` labels and `RecommendedDisplayCIELabValue` colors to sRGB, exposes `GET /api/studies/{study}/series/{series}/segmentations`, seeds a 16-frame **RUL Spiculated Nodule DICOM SEG** phantom (`4` series / `128` frames total), excludes `SEG` planes from CT/MR slice KNN, and renders affine-aligned translucent lesion masks in both **2D Stack** and **3D MPR** (Axial / Sagittal / Coronal) with per-segment visibility toggles, a `10%–100%` opacity slider, and **"Center SEG"** camera alignment.
 - **Measurement -> DICOM SR (`TID 1500`) Round-Trip (`src/sr.rs`, `src/api.rs`, `web/src/cornerstone/measurements.ts`)**: Serializes Cornerstone3D `Length`, `Bidirectional` (RECIST), and `EllipticalROI` (Area / Mean HU / SD) annotations and clinician notes into DICOM Part-10 `ComprehensiveSRStorage` (`TID 1500`) via `POST /api/studies/{study}/series/{series}/measurements/sr`, stores the new SR series via **STOW-RS** (`POST /dicomweb/studies`, or direct store ingest when server `--deidentify` is active), and indexes it immediately for Hybrid BM25 + Vector search.
@@ -88,7 +89,7 @@ cargo run --release -- --seed-on-start --port 8090 --data-dir ./data
 # Run the published container image from GHCR (amd64)
 docker run --rm -p 8090:8090 -e SEED_ON_START=true ghcr.io/brucearctor/dicom-lance:latest
 
-# Or build locally
+# Or build locally (multi-stage Dockerfile with cargo-chef dependency layer caching)
 docker build -t dicom-lance .
 docker run --rm -p 8090:8090 -e SEED_ON_START=true dicom-lance
 ```
@@ -113,7 +114,23 @@ curl -s "http://127.0.0.1:8090/dicomweb/studies/1.2.826.0.1.3680043.10.5432.1001
 # WADO-RS frame byte-range read via Lance BlobFile::read_range
 curl -i -H "Range: bytes=0-1023" \
   "http://127.0.0.1:8090/dicomweb/studies/1.2.826.0.1.3680043.10.5432.1001/series/1.2.826.0.1.3680043.10.5432.1001.1/instances/1.2.826.0.1.3680043.10.5432.1001.1.23/frames/1"
+
+# WADO-RS /rendered windowed lung slice (PNG) & resized JPEG
+curl -sf -H "Accept: image/png" \
+  "http://127.0.0.1:8090/dicomweb/studies/1.2.826.0.1.3680043.10.5432.1001/series/1.2.826.0.1.3680043.10.5432.1001.1/rendered?window=-600,1500&viewport=512,512" \
+  -o /tmp/chest_ct.png
 ```
+
+## Benchmarks (`10,240+` Frames)
+
+Measured in release mode on an Apple M2 (`24 GiB` RAM, **40 studies / 80 series / 10,240 16-bit frames** = `320.0 MiB` raw pixel payload):
+
+- **Bulk Ingest + Indexing**: **1,402.6 ms** (**7,301 frames/sec**) into Lance `2.2` `Packed` Blob V2
+- **Lance `take_blobs` Frame Read**: **1.14 ms** p50 (**860.5 ops/s**) · Byte-range (`0..4096`): **1.16 ms** p50
+- **WADO-RS `/rendered` (`PNG` / `JPEG` `256x256`)**: **1.67 ms** p50 (**592.3 ops/s**) / **1.80 ms** p50 (**554.7 ops/s**)
+- **Hybrid BM25 + Vector Search**: **1.85 ms** p50 · **768-d Slice KNN across >10k frames**: **2.84 ms** p50
+
+See [BENCHMARKS.md](BENCHMARKS.md) and `src/bin/dicom-lance-bench.rs` to reproduce on your hardware.
 
 ## Test Suites
 

@@ -7,6 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- **WADO-RS `/rendered` Endpoint (`src/render.rs`, `src/store.rs`, `src/api.rs`)**:
+  - Added PS3.18 server-side rendering routes at `/dicomweb/studies/{study}/series/{series}/rendered`, `/dicomweb/studies/{study}/series/{series}/instances/{sop}/rendered`, and `/dicomweb/studies/{study}/series/{series}/instances/{sop}/frames/{frames}/rendered`.
+  - Supports quality-weighted `Accept` negotiation (`image/png`, `image/jpeg` via existing `jpeg-encoder`, `multipart/related`), `window=center,width[,LINEAR|LINEAR_EXACT|SIGMOID]`, aspect-preserving bilinear `viewport=vw,vh`, `quality=1..100`, `iccprofile`, `MONOCHROME1` inversion, `Cache-Control`, and `Vary: Accept`.
+- **10k+ Frame Benchmark Suite & `BENCHMARKS.md` (`src/bin/dicom-lance-bench.rs`)**:
+  - Added `dicom-lance-bench` CLI measuring bulk ingest, incremental `MergeInsert`, `take_blobs` full/range reads, WADO-RS `/frames` (`ExplicitVRLE`/`RLE`), `/rendered` (PNG/JPEG), `/frames-manifest`, BM25/Vector/Hybrid search, 768-d slice KNN, and `delete_study` + `compact_and_cleanup`.
+  - Recorded `10,240`-frame (`320 MiB` raw pixel) release results (`7,301 frames/s` ingest, `1.14 ms` p50 `take_blobs`, `1.67 ms` p50 PNG `/rendered`, `2.84 ms` p50 768-d slice KNN) in `BENCHMARKS.md`.
+- **Docker `cargo-chef` Build Caching (`Dockerfile`, `.dockerignore`, `.github/workflows/ci.yml`)**:
+  - Updated multi-stage `Dockerfile` to prepare and cache Rust dependency compilation with `lukemathwalker/cargo-chef:latest-rust-1-bookworm` (`--bin dicom-lance`) and expanded the CI container smoke test to assert HTTP 200 PNG magic bytes from `/rendered`.
 - **Interactive SEG Controls & 3D MPR SEG Overlays (`web/src/cornerstone/`)**:
   - Added per-segment visibility toggles (`aria-pressed`), a `10%–100%` overlay opacity slider, and **"Center SEG"** camera alignment.
   - Enabled **SEG Overlay** in **3D MPR** across Axial, Sagittal, and Coronal WebGL viewports via an affine tight-bbox 3D mask reslicer (`buildSegVolumeLayers`, `resliceSegVolumesToCanvasRgba`).

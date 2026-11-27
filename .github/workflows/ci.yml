@@ -110,3 +110,6 @@ jobs:
           stats=$(curl -sf http://127.0.0.1:18095/api/stats)
           echo "$stats"
           echo "$stats" | jq -e '.frames_dataset.storage_version == "2.2" and .blob_v2_kind_sample == "Packed" and .series_dataset.row_count == 4 and .frames_dataset.row_count == 128'
+          curl -sf "http://127.0.0.1:18095/dicomweb/studies/1.2.826.0.1.3680043.10.5432.1001/series/1.2.826.0.1.3680043.10.5432.1001.1/rendered?window=-600,1500" -o /tmp/rendered.png
+          test "$(od -An -N4 -tx1 /tmp/rendered.png | tr -d ' \n')" = "89504e47"
+          rm -f /tmp/rendered.png
