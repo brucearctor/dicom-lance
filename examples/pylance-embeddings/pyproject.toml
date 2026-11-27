@@ -1,6 +1,6 @@
 [project]
 name = "dicom-lance-embed"
-version = "0.3.0"
+version = "0.4.0"
 description = "Read Lance v2.2 Blob V2 DICOM frames into NumPy/PyTorch, compute 768-d multimodal embeddings, and update Lance datasets live"
 readme = "README.md"
 license = "Apache-2.0"

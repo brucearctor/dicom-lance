@@ -4,7 +4,7 @@ All notable changes to `dicom-lance` are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-11-27
 
 ### Added
 - **WADO-RS `/rendered` Endpoint (`src/render.rs`, `src/store.rs`, `src/api.rs`)**:
@@ -33,7 +33,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Viewer Hardening Controls (`web/src/`)**:
   - Added RAM-only Bearer Token unlock/lock session workflow (`ApiUnauthorizedError` + Cornerstone `beforeSend`), Upload modal `De-identify PHI` toggle, server directory-ingest policy enforcement, and WCAG 2.2 AA two-step `Delete` -> `Confirm` study removal in the sidebar.
 - **Tests**:
-  - Added Rust Hegel PBT properties and integration tests for PS3.15 de-identification (including SEG overlay cross-reference preservation), Bearer auth/CORS/directory-guard enforcement, and `DELETE` + `compact_files`/cleanup lifecycle, plus Vitest and hermetic Playwright E2E coverage.
+  - Added Rust Hegel PBT properties and integration tests for WADO-RS `/rendered`, `TID 1500` measurement SR STOW-RS round-trip, PS3.15 de-identification (including SEG overlay cross-reference preservation), Bearer auth/CORS/directory-guard enforcement, and `DELETE` + `compact_files`/cleanup lifecycle, plus Vitest, Hegel PBT, and Playwright E2E coverage for 3D MPR SEG overlays and measurements.
+
+### Fixed
+- Keyed loaded `frames` and `segmentations` by `seriesUid` in `web/src/cornerstone/DicomWorkspace.tsx` to prevent stale cross-study SEG fetches when switching studies from active 3D MPR SEG overlay mode.
+- Normalized binary `1`-encoded mask values to `1.0` coverage in `resliceSegVolumesToCanvasRgba` (`web/src/cornerstone/segOverlay.ts`) to match `compositeSegMasksRgba`.
 
 ## [0.3.0] - 2026-11-24
 
